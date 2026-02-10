@@ -1,0 +1,34 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install BCC from upstream iovisor PPA for latest kernel support
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        gnupg2 \
+        && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 4052245BD4284CDD && \
+    echo "deb https://repo.iovisor.org/apt/jammy jammy main" > /etc/apt/sources.list.d/iovisor.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bcc-tools \
+        libbcc-examples \
+        python3-bcc \
+        python3 \
+        curl \
+        iproute2 \
+    || apt-get install -y --no-install-recommends \
+        bpfcc-tools \
+        python3-bpfcc \
+        python3 \
+        curl \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy BPF source and test script
+COPY bpf/ /app/bpf/
+COPY test/bcc/ /app/test/
+
+WORKDIR /app
+
+CMD ["python3", "test/test_socket_trace.py"]

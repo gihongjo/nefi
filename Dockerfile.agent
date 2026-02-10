@@ -1,0 +1,33 @@
+# Stage 1: Build BPF program + Go binary
+FROM golang:1.24-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        llvm \
+        libbpf-dev \
+        linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/include/$(gcc -dumpmachine)/asm /usr/include/asm
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Generate BPF object + Go bindings via bpf2go
+RUN cd internal/agent/ebpf && go generate
+
+# Build static Go binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /nefi-agent ./cmd/nefi-agent
+
+# amd64로 빌드 시
+# RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /nefi-agent ./cmd/nefi-agent
+
+# Stage 2: Minimal runtime image
+FROM debian:bookworm-slim
+
+COPY --from=builder /nefi-agent /nefi-agent
+
+ENTRYPOINT ["/nefi-agent"]

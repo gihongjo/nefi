@@ -1,0 +1,66 @@
+  전체 흐름
+
+  커널 (eBPF C) ──ring buffer──▶ Go (cilium/ebpf) ──▶ 출력
+
+  1단계: 커널에서 이벤트 캡처 (bpf/nefi_trace.c)
+
+  syscall tracepoint에 훅을 걸어서 소켓 I/O를 감시합니다:
+
+  connect()  → fd를 socket_fds 맵에 등록
+  accept4()  → fd를 socket_fds 맵에 등록
+  write()    → socket fd인지 확인 → 버퍼 주소 저장 → 완료 시 payload 캡처
+  read()     → 동일
+  sendto()   → 동일
+  recvfrom() → 동일
+  close()    → socket_fds에서 제거
+
+  enter/exit 두 단계로 나뉘는 이유: enter에서 유저 버퍼 주소를 저장하고, exit에서 실제 전송된 바이트 수(ret)를 알 수 있기 때문입니다.
+
+  2단계: Ring Buffer로 전달 (emit_event)
+
+  nefi_trace.c:85-111에서 data_event_t 구조체를 ring buffer에 씁니다:
+
+  // ring buffer에 공간 예약
+  event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+
+  // 이벤트 정보 채움
+  event->pid = ...;
+  event->fd = ...;
+  event->direction = ...; // 0=send, 1=recv
+  bpf_probe_read_user(&event->msg, copy, (void *)a->buf); // payload 복사
+
+  // ring buffer에 제출 → Go 쪽에서 읽을 수 있게 됨
+  bpf_ringbuf_submit(event, 0);
+
+  핵심은 bpf_ringbuf_reserve → 채우기 → bpf_ringbuf_submit입니다. submit하면 Go 쪽 reader가 깨어납니다.
+
+  3단계: Go에서 읽기 (internal/agent/ebpf/loader.go)
+
+  // ring buffer reader 열기 (C의 events 맵과 연결)
+  reader, err := ringbuf.NewReader(objs.Events)
+
+  // 이벤트 읽기 (블로킹 — submit될 때까지 대기)
+  record, err := l.reader.Read()
+
+  // raw bytes → Go struct로 디코딩
+  binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event)
+
+  4단계: C struct ↔ Go struct 매칭
+
+  이 부분이 제일 중요합니다. 필드 순서와 크기가 정확히 일치해야 합니다:
+
+  C (packed)                    Go
+  ──────────────────────────    ──────────────────────
+  u64  timestamp_ns         ←→  TimestampNs uint64
+  u32  pid                  ←→  PID         uint32
+  u32  fd                   ←→  FD          uint32
+  u32  msg_size             ←→  MsgSize     uint32
+  u8   direction            ←→  Direction   uint8
+  char comm[16]             ←→  Comm        [16]byte
+  char msg[512]             ←→  Msg         [512]byte
+
+  C쪽에 __attribute__((packed))가 있어서 패딩 없이 순서대로 나열됩니다. Go의 binary.Read가 LittleEndian으로 같은 순서로 읽습니다.
+
+  연결 고리: bpf2go
+
+  go generate가 .c → .o로 컴파일하고, .o를 Go 파일에 //go:embed으로 내장합니다. 런타임에 loadNefiTraceObjects()가 이 바이트코드를 커널에 로드하고, objs.Events로 ring buffer 맵에 접근할 수 있게 됩니다.
