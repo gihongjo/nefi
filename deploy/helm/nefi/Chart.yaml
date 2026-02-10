@@ -1,0 +1,14 @@
+apiVersion: v2
+name: nefi
+description: Kubernetes observability tool — service topology, metrics, and event visualization
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kubernetes
+  - observability
+  - ebpf
+  - topology
+  - monitoring
+maintainers:
+  - name: gihongjo

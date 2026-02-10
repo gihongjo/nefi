@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ebpf-test
+  namespace: nefi
+spec:
+  hostPID: true
+  hostNetwork: true
+  containers:
+    - name: ebpf-test
+      image: ghcr.io/gihongjo/nefi-ebpf-test:latest
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: sys-kernel-debug
+          mountPath: /sys/kernel/debug
+          readOnly: true
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+  volumes:
+    - name: sys-kernel-debug
+      hostPath:
+        path: /sys/kernel/debug
+    - name: sys-fs-bpf
+      hostPath:
+        path: /sys/fs/bpf
+  restartPolicy: Never

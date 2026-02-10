@@ -1,0 +1,31 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# eBPF compiled objects
+bpf/*.o
+
+# UI
+ui/node_modules/
+ui/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage
+coverage.out
+coverage.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local

@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package nefi;
+
+option go_package = "github.com/gihongjo/nefi/internal/proto";
+
+// EventIngestion service receives events from nefi-agent.
+service EventIngestion {
+  // StreamEvents sends a stream of events from agent to server.
+  rpc StreamEvents(stream EventBatch) returns (StreamResponse);
+}
+
+message EventBatch {
+  string node = 1;
+  repeated ConnectionEvent connections = 2;
+  repeated HTTPRequestEvent http_requests = 3;
+}
+
+message StreamResponse {
+  uint64 accepted = 1;
+  string error = 2;
+}
+
+message EndpointProto {
+  string ip = 1;
+  uint32 port = 2;
+  string pod = 3;
+  string namespace = 4;
+  string workload = 5;
+  string workload_type = 6;
+  string service = 7;
+}
+
+message ConnectionEvent {
+  int64 timestamp_ns = 1;
+  string node = 2;
+  EndpointProto source = 3;
+  EndpointProto destination = 4;
+  uint64 bytes_sent = 5;
+  uint64 bytes_recv = 6;
+  uint64 duration_ns = 7;
+  uint32 retransmits = 8;
+  string protocol = 9;
+}
+
+message HTTPRequestEvent {
+  int64 timestamp_ns = 1;
+  string node = 2;
+  EndpointProto source = 3;
+  EndpointProto destination = 4;
+  string method = 5;
+  string path = 6;
+  uint32 status_code = 7;
+  uint64 latency_ns = 8;
+  string protocol = 9;
+}

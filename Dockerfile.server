@@ -1,0 +1,14 @@
+# Stage 1: Build Go binary
+FROM golang:1.25-bookworm AS go-builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o nefi-server ./cmd/nefi-server
+
+# Stage 2: Runtime
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=go-builder /build/nefi-server /usr/local/bin/nefi-server
+
+EXPOSE 8080 9090
+ENTRYPOINT ["/usr/local/bin/nefi-server"]

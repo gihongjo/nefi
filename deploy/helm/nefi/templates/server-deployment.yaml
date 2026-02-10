@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nefi-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: nefi-server
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.server.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nefi-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nefi-server
+        app.kubernetes.io/component: server
+    spec:
+      containers:
+        - name: server
+          image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}"
+          imagePullPolicy: {{ .Values.server.image.pullPolicy }}
+          env:
+            - name: ES_ADDRESSES
+              value: "http://nefi-elasticsearch.{{ .Values.namespace }}.svc.cluster.local:9200"
+            - name: GRPC_PORT
+              value: "{{ .Values.server.grpcPort }}"
+            - name: HTTP_PORT
+              value: "{{ .Values.server.httpPort }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.server.grpcPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}

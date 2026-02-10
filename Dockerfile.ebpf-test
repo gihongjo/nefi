@@ -1,0 +1,20 @@
+# Stage 1: Compile eBPF programs
+FROM ubuntu:24.04 AS bpf-builder
+RUN apt-get update && apt-get install -y --no-install-recommends clang llvm libbpf-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY bpf/ bpf/
+RUN clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I bpf -c bpf/connection_tracker.c -o bpf/connection_tracker.o
+
+# Stage 2: Build Go test binary
+FROM golang:1.25-bookworm AS go-builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ebpf-test ./cmd/ebpf-test
+
+# Stage 3: Runtime
+FROM debian:bookworm-slim
+COPY --from=bpf-builder /build/bpf/connection_tracker.o /opt/nefi/bpf/connection_tracker.o
+COPY --from=go-builder /build/ebpf-test /usr/local/bin/ebpf-test
+ENTRYPOINT ["/usr/local/bin/ebpf-test"]

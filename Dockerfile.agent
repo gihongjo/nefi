@@ -1,0 +1,30 @@
+# Stage 1: Build eBPF programs
+FROM ubuntu:24.04 AS bpf-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang llvm libbpf-dev linux-headers-generic \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY bpf/ bpf/
+RUN clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+    -c bpf/connection_tracker.c -o bpf/connection_tracker.o -I bpf && \
+    clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+    -c bpf/http_parser.c -o bpf/http_parser.o -I bpf && \
+    clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+    -c bpf/dns_tracker.c -o bpf/dns_tracker.o -I bpf
+
+# Stage 2: Build Go binary
+FROM golang:1.25-bookworm AS go-builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=bpf-builder /build/bpf/*.o bpf/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o nefi-agent ./cmd/nefi-agent
+
+# Stage 3: Runtime
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=go-builder /build/nefi-agent /usr/local/bin/nefi-agent
+COPY --from=bpf-builder /build/bpf/*.o /opt/nefi/bpf/
+
+ENTRYPOINT ["/usr/local/bin/nefi-agent"]
