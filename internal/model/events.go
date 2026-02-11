@@ -1,6 +1,40 @@
 package model
 
-const MaxMsgSize = 512
+const MaxMsgSize = 4096
+
+// Protocol matches the BPF enum protocol_t (Pixie-compatible numbering).
+type Protocol uint8
+
+const (
+	ProtoUnknown Protocol = 0
+	ProtoHTTP    Protocol = 1
+	ProtoHTTP2   Protocol = 2
+	ProtoMySQL   Protocol = 3
+	ProtoCQL     Protocol = 4
+	ProtoPgSQL   Protocol = 5
+	ProtoDNS     Protocol = 6
+	ProtoRedis   Protocol = 7
+	ProtoNATS    Protocol = 8
+	ProtoMongo   Protocol = 9
+	ProtoKafka   Protocol = 10
+	ProtoMux     Protocol = 11
+	ProtoAMQP    Protocol = 12
+	ProtoTLS     Protocol = 13
+)
+
+var protoNames = [14]string{
+	"UNKNOWN", "HTTP", "HTTP2", "MySQL",
+	"CQL", "PgSQL", "DNS", "Redis",
+	"NATS", "Mongo", "Kafka", "Mux",
+	"AMQP", "TLS",
+}
+
+func (p Protocol) String() string {
+	if int(p) < len(protoNames) {
+		return protoNames[p]
+	}
+	return "UNKNOWN"
+}
 
 // DataEvent matches the packed BPF struct data_event_t.
 // Field order and sizes must exactly match the C definition.
@@ -10,6 +44,7 @@ type DataEvent struct {
 	FD          uint32
 	MsgSize     uint32
 	Direction   uint8 // 0 = send, 1 = recv
+	Protocol    Protocol
 	Comm        [16]byte
 	Msg         [MaxMsgSize]byte
 }
