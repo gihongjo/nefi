@@ -36,6 +36,26 @@ func (p Protocol) String() string {
 	return "UNKNOWN"
 }
 
+// MsgType matches the BPF enum msg_type_t.
+type MsgType uint8
+
+const (
+	MsgUnknown  MsgType = 0
+	MsgRequest  MsgType = 1
+	MsgResponse MsgType = 2
+)
+
+func (m MsgType) String() string {
+	switch m {
+	case MsgRequest:
+		return "REQ"
+	case MsgResponse:
+		return "RES"
+	default:
+		return "UNK"
+	}
+}
+
 // DataEvent matches the packed BPF struct data_event_t.
 // Field order and sizes must exactly match the C definition.
 type DataEvent struct {
@@ -45,6 +65,7 @@ type DataEvent struct {
 	MsgSize     uint32
 	Direction   uint8 // 0 = send, 1 = recv
 	Protocol    Protocol
+	MsgType     MsgType
 	Comm        [16]byte
 	Msg         [MaxMsgSize]byte
 }

@@ -50,30 +50,26 @@ func main() {
 			continue
 		}
 
-		// Print event with protocol tag.
+		// Print event with protocol and message type tags.
 		dir := event.DirectionString()
 		comm := event.CommString()
 		proto := event.Protocol.String()
+		msgType := event.MsgType.String()
 
-		if comm == "nefi-server" {
-
-			fmt.Printf("  %s | pid=%-6d fd=%-4d size=%-6d proto=%-7s [%s]\n",
-				dir, event.PID, event.FD, event.MsgSize, proto, comm)
-			payload := event.Payload()
-			if len(payload) > 0 {
-				line := make([]byte, len(payload))
-				for i, b := range payload {
-					if b >= 32 && b < 127 {
-						line[i] = b
-					} else {
-						line[i] = '.'
-					}
+		fmt.Printf("  %s | pid=%-6d fd=%-4d size=%-6d proto=%-7s type=%-3s [%s]\n",
+			dir, event.PID, event.FD, event.MsgSize, proto, msgType, comm)
+		payload := event.Payload()
+		if len(payload) > 0 {
+			line := make([]byte, len(payload))
+			for i, b := range payload {
+				if b >= 32 && b < 127 {
+					line[i] = b
+				} else {
+					line[i] = '.'
 				}
-				fmt.Printf("           | %s\n", string(line))
 			}
+			fmt.Printf("           | %s\n", string(line))
 		}
-
-		// Show printable ASCII payload.
 
 	}
 

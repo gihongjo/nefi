@@ -2,7 +2,7 @@
 //
 // nefi_trace.c — libbpf/CO-RE socket data capture
 // Traces socket I/O via syscall tracepoints and captures payload.
-// Ported from the working BCC test (test_socket_trace.py).
+// Protocol detection ported from Pixie's protocol_inference.h.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -11,11 +11,15 @@ typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef unsigned long long u64;
+typedef long long      s64;
+typedef int            s32;
+typedef signed char    s8;
+typedef short          s16;
 
 #define MAX_MSG_SIZE 4096
+#define PROBE_BUF_SIZE 64
 
 // ─── Tracepoint context structs ─────────────────────────────────
-// These match the kernel tracepoint format (common header included).
 
 struct trace_event_raw_sys_enter {
 	unsigned short common_type;
@@ -35,7 +39,7 @@ struct trace_event_raw_sys_exit {
 	long           ret;
 };
 
-// ─── Protocol enum (matches Pixie traffic_protocol_t) ───────────
+// ─── Protocol & message type enums (Pixie-compatible) ───────────
 
 enum protocol_t {
 	PROTO_UNKNOWN = 0,
@@ -54,6 +58,12 @@ enum protocol_t {
 	PROTO_TLS     = 13,
 };
 
+enum msg_type_t {
+	MSG_UNKNOWN  = 0,
+	MSG_REQUEST  = 1,
+	MSG_RESPONSE = 2,
+};
+
 // ─── Data structures ────────────────────────────────────────────
 
 struct data_event_t {
@@ -63,6 +73,7 @@ struct data_event_t {
 	u32  msg_size;
 	u8   direction; // 0 = send, 1 = recv
 	u8   protocol;
+	u8   msg_type;  // 0 = unknown, 1 = request, 2 = response
 	char comm[16];
 	char msg[MAX_MSG_SIZE];
 } __attribute__((packed));
@@ -70,6 +81,13 @@ struct data_event_t {
 struct args_t {
 	u64 buf; // userspace buffer pointer
 	u32 fd;
+};
+
+// Per-connection state for stateful protocol detection (MySQL, Kafka).
+struct conn_state_t {
+	u8   protocol;
+	u32  prev_count;
+	char prev_buf[4];
 };
 
 // ─── BPF Maps ───────────────────────────────────────────────────
@@ -100,226 +118,579 @@ struct {
 	__type(value, struct args_t);
 } active_recv_args SEC(".maps");
 
-// ─── Protocol detection ─────────────────────────────────────────
-// Inspects first bytes of captured payload. Best-effort; Go can
-// refine further. Ordered: text protocols first (high confidence),
-// then binary protocols (heuristic).
+// Connection state map for stateful protocol detection.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);  // pid<<32 | fd
+	__type(value, struct conn_state_t);
+} conn_state SEC(".maps");
 
-static __always_inline u8 detect_protocol(const char *msg, u32 len)
+// ─── Helpers (ported from Pixie bpf_tools/utils.h) ──────────────
+
+static __always_inline s32 read_big_endian_s32(const char *buf)
 {
-	if (len < 4)
-		return PROTO_UNKNOWN;
+	return ((s32)(u8)buf[0] << 24) | ((s32)(u8)buf[1] << 16) |
+	       ((s32)(u8)buf[2] << 8)  | (s32)(u8)buf[3];
+}
 
-	u8 b0 = (u8)msg[0];
-	u8 b1 = (u8)msg[1];
-	u8 b2 = (u8)msg[2];
-	u8 b3 = (u8)msg[3];
+static __always_inline s16 read_big_endian_s16(const char *buf)
+{
+	return ((s16)(u8)buf[0] << 8) | (s16)(u8)buf[1];
+}
 
-	// ── TLS: 0x16 (handshake) + version 0x03.{01-04} ──
-	if (b0 == 0x16 && b1 == 0x03 && b2 >= 0x01 && b2 <= 0x04)
-		return PROTO_TLS;
+// ─── Protocol detection (ported from Pixie protocol_inference.h) ─
 
-	// ── AMQP: "AMQP" magic ──
-	if (b0 == 'A' && b1 == 'M' && b2 == 'Q' && b3 == 'P')
-		return PROTO_AMQP;
+// HTTP (Pixie: infer_http_message)
+static __noinline u8 infer_http(const char *buf, u32 count)
+{
+	if (count < 16)
+		return MSG_UNKNOWN;
 
-	// ── Text-based: first-byte switch (HTTP, NATS, Redis) ──
-	switch (b0) {
-	case 'G':
-		if (b1 == 'E' && b2 == 'T' && b3 == ' ')
-			return PROTO_HTTP;
-		break;
-	case 'P':
-		if (b1 == 'R' && b2 == 'I' && b3 == ' ')
-			return PROTO_HTTP2;
-		if (len >= 5 && b1 == 'O' && b2 == 'S' && b3 == 'T' &&
-		    (u8)msg[4] == ' ')
-			return PROTO_HTTP;
-		if (b1 == 'U' && b2 == 'T' && b3 == ' ')
-			return PROTO_HTTP;
-		if (len >= 6 && b1 == 'A' && b2 == 'T' && b3 == 'C' &&
-		    (u8)msg[4] == 'H' && (u8)msg[5] == ' ')
-			return PROTO_HTTP;
-		// NATS
-		if (b1 == 'U' && b2 == 'B' && b3 == ' ')
-			return PROTO_NATS;
-		if (b1 == 'I' && b2 == 'N' && b3 == 'G')
-			return PROTO_NATS;
-		if (b1 == 'O' && b2 == 'N' && b3 == 'G')
-			return PROTO_NATS;
-		break;
-	case 'H':
-		if (len >= 6 && b1 == 'T' && b2 == 'T' && b3 == 'P' &&
-		    (u8)msg[4] == '/') {
-			if ((u8)msg[5] == '2')
-				return PROTO_HTTP2;
-			return PROTO_HTTP;
-		}
-		if (len >= 5 && b1 == 'E' && b2 == 'A' && b3 == 'D' &&
-		    (u8)msg[4] == ' ')
-			return PROTO_HTTP;
-		break;
-	case 'D':
-		if (len >= 7 && b1 == 'E' && b2 == 'L' && b3 == 'E' &&
-		    (u8)msg[4] == 'T' && (u8)msg[5] == 'E' && (u8)msg[6] == ' ')
-			return PROTO_HTTP;
-		break;
-	case 'O':
-		if (len >= 8 && b1 == 'P' && b2 == 'T' && b3 == 'I' &&
-		    (u8)msg[4] == 'O' && (u8)msg[5] == 'N' && (u8)msg[6] == 'S' &&
-		    (u8)msg[7] == ' ')
-			return PROTO_HTTP;
-		break;
-	case 'C':
-		if (len >= 8 && b1 == 'O' && b2 == 'N' && b3 == 'N' &&
-		    (u8)msg[4] == 'E' && (u8)msg[5] == 'C' && (u8)msg[6] == 'T' &&
-		    (u8)msg[7] == ' ')
-			return PROTO_HTTP;
-		break;
-	// NATS text commands
-	case 'I':
-		if (len >= 5 && b1 == 'N' && b2 == 'F' && b3 == 'O' &&
-		    (u8)msg[4] == ' ')
-			return PROTO_NATS;
-		break;
-	case 'M':
-		if (b1 == 'S' && b2 == 'G' && b3 == ' ')
-			return PROTO_NATS;
-		break;
-	case 'S':
-		if (b1 == 'U' && b2 == 'B' && b3 == ' ')
-			return PROTO_NATS;
-		break;
-	// Redis RESP / NATS ack
-	case '+':
-		if (b1 == 'O' && b2 == 'K')
-			return PROTO_NATS;
-		if (b1 >= '0' && b1 <= '9')
-			return PROTO_REDIS;
-		break;
-	case '-':
-		if (b1 == 'E' && b2 == 'R' && b3 == 'R')
-			return PROTO_NATS;
-		if (b1 >= '0' && b1 <= '9')
-			return PROTO_REDIS;
-		break;
-	case '*':
-	case '$':
-	case ':':
-		if (b1 >= '0' && b1 <= '9')
-			return PROTO_REDIS;
-		break;
+	// Response: HTTP/...
+	if (buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P')
+		return MSG_RESPONSE;
+	// GET
+	if (buf[0] == 'G' && buf[1] == 'E' && buf[2] == 'T')
+		return MSG_REQUEST;
+	// HEAD
+	if (buf[0] == 'H' && buf[1] == 'E' && buf[2] == 'A' && buf[3] == 'D')
+		return MSG_REQUEST;
+	// POST
+	if (buf[0] == 'P' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'T')
+		return MSG_REQUEST;
+	// PUT
+	if (buf[0] == 'P' && buf[1] == 'U' && buf[2] == 'T')
+		return MSG_REQUEST;
+	// DELETE
+	if (count >= 16 && buf[0] == 'D' && buf[1] == 'E' && buf[2] == 'L' &&
+	    buf[3] == 'E' && buf[4] == 'T' && buf[5] == 'E')
+		return MSG_REQUEST;
+	// PATCH
+	if (buf[0] == 'P' && buf[1] == 'A' && buf[2] == 'T' && buf[3] == 'C' &&
+	    buf[4] == 'H')
+		return MSG_REQUEST;
+	// OPTIONS
+	if (count >= 16 && buf[0] == 'O' && buf[1] == 'P' && buf[2] == 'T')
+		return MSG_REQUEST;
+	// CONNECT
+	if (count >= 16 && buf[0] == 'C' && buf[1] == 'O' && buf[2] == 'N' &&
+	    buf[3] == 'N')
+		return MSG_REQUEST;
+
+	return MSG_UNKNOWN;
+}
+
+// TLS (Pixie: infer_tls_message)
+static __noinline u8 infer_tls(const char *buf, u32 count)
+{
+	if (count < 6)
+		return MSG_UNKNOWN;
+
+	u8 content_type = (u8)buf[0];
+	if (content_type != 0x16) // Handshake
+		return MSG_UNKNOWN;
+
+	u16 version = ((u16)(u8)buf[1] << 8) | (u8)buf[2];
+	if (version < 0x0300 || version > 0x0304)
+		return MSG_UNKNOWN;
+
+	u8 handshake_type = (u8)buf[5];
+	if (handshake_type == 2)
+		return MSG_RESPONSE; // ServerHello
+	if (handshake_type == 1)
+		return MSG_REQUEST; // ClientHello
+
+	return MSG_UNKNOWN;
+}
+
+// CQL / Cassandra (Pixie: infer_cql_message)
+static __noinline u8 infer_cql(const char *buf, u32 count)
+{
+	if (count < 9)
+		return MSG_UNKNOWN;
+
+	u8 request = ((u8)buf[0] & 0x80) == 0x00;
+	u8 version = (u8)buf[0] & 0x7f;
+	u8 flags   = (u8)buf[1];
+	u8 opcode  = (u8)buf[4];
+
+	if (version < 3 || version > 5)
+		return MSG_UNKNOWN;
+	if ((flags & 0xf0) != 0)
+		return MSG_UNKNOWN;
+
+	s32 length = read_big_endian_s32(buf + 5);
+	if (length > 10000)
+		return MSG_UNKNOWN;
+
+	// Request opcodes
+	if (opcode == 0x01 || opcode == 0x05 || opcode == 0x07 ||
+	    opcode == 0x09 || opcode == 0x0a || opcode == 0x0b ||
+	    opcode == 0x0d || opcode == 0x0f)
+		return request ? MSG_REQUEST : MSG_UNKNOWN;
+
+	// Response opcodes
+	if (opcode == 0x00 || opcode == 0x02 || opcode == 0x03 ||
+	    opcode == 0x06 || opcode == 0x08 || opcode == 0x0c ||
+	    opcode == 0x0e || opcode == 0x10)
+		return !request ? MSG_RESPONSE : MSG_UNKNOWN;
+
+	return MSG_UNKNOWN;
+}
+
+// MongoDB (Pixie: infer_mongo_message)
+static __noinline u8 infer_mongo(const char *buf, u32 count)
+{
+	if (count < 16)
+		return MSG_UNKNOWN;
+
+	s32 msg_len    = (s32)((u32)(u8)buf[0] | ((u32)(u8)buf[1] << 8) |
+	                 ((u32)(u8)buf[2] << 16) | ((u32)(u8)buf[3] << 24));
+	s32 request_id = (s32)((u32)(u8)buf[4] | ((u32)(u8)buf[5] << 8) |
+	                 ((u32)(u8)buf[6] << 16) | ((u32)(u8)buf[7] << 24));
+	s32 response_to = (s32)((u32)(u8)buf[8] | ((u32)(u8)buf[9] << 8) |
+	                  ((u32)(u8)buf[10] << 16) | ((u32)(u8)buf[11] << 24));
+	s32 opcode     = (s32)((u32)(u8)buf[12] | ((u32)(u8)buf[13] << 8) |
+	                 ((u32)(u8)buf[14] << 16) | ((u32)(u8)buf[15] << 24));
+
+	if (msg_len < 16)
+		return MSG_UNKNOWN;
+	if (request_id < 0)
+		return MSG_UNKNOWN;
+
+	// Valid opcodes: OP_UPDATE(2001)..OP_KILL_CURSORS(2007), OP_COMPRESSED(2012), OP_MSG(2013)
+	if (opcode == 2001 || opcode == 2002 || opcode == 2003 || opcode == 2004 ||
+	    opcode == 2005 || opcode == 2006 || opcode == 2007 ||
+	    opcode == 2012 || opcode == 2013) {
+		if (response_to == 0)
+			return MSG_REQUEST;
 	}
 
-	// ── MySQL: 3-byte len + seq=0 + known command byte ──
-	if (len >= 5 && b3 == 0) {
-		u8 cmd = (u8)msg[4];
-		if (cmd == 0x0a || // server greeting (v10)
-		    cmd == 0x01 || // COM_QUIT
-		    cmd == 0x02 || // COM_INIT_DB
-		    cmd == 0x03 || // COM_QUERY
-		    cmd == 0x04 || // COM_FIELD_LIST
-		    cmd == 0x16 || // COM_STMT_PREPARE
-		    cmd == 0x17 || // COM_STMT_EXECUTE
-		    cmd == 0x19)   // COM_STMT_CLOSE
-			return PROTO_MYSQL;
-	}
-	// MySQL response: seq > 0, OK/ERR/EOF marker
-	if (len >= 5 && b3 > 0 && b3 < 10) {
-		u8 resp = (u8)msg[4];
-		if (resp == 0x00 || resp == 0xFE || resp == 0xFF)
-			return PROTO_MYSQL;
-	}
+	return MSG_UNKNOWN;
+}
 
-	// ── CQL (Cassandra): version byte + valid opcode ──
-	if (len >= 9 &&
-	    (b0 == 0x03 || b0 == 0x04 || b0 == 0x05 ||
-	     b0 == 0x83 || b0 == 0x84 || b0 == 0x85)) {
-		if ((u8)msg[4] <= 0x10)
-			return PROTO_CQL;
-	}
-
-	// ── PostgreSQL ──
+// PostgreSQL (Pixie: infer_pgsql_message)
+static __noinline u8 infer_pgsql(const char *buf, u32 count)
+{
 	// Startup message: 4-byte length + protocol version 3.0
-	if (len >= 8) {
-		u32 ver = ((u32)(u8)msg[4] << 24) | ((u32)(u8)msg[5] << 16) |
-			  ((u32)(u8)msg[6] << 8)  | (u32)(u8)msg[7];
-		if (ver == 0x00030000)
-			return PROTO_PGSQL;
-	}
-	// Regular message: type byte + 4-byte big-endian length
-	if (len >= 5 &&
-	    (b0 == 'Q' || b0 == 'R' || b0 == 'T' || b0 == 'X' ||
-	     b0 == 'E' || b0 == 'Z' || b0 == 'K')) {
-		u32 plen = ((u32)b1 << 24) | ((u32)b2 << 16) |
-			   ((u32)b3 << 8)  | (u32)(u8)msg[4];
-		if (plen >= 4 && plen <= 0x100000)
-			return PROTO_PGSQL;
+	if (count >= 12) {
+		s32 length = read_big_endian_s32(buf);
+		if (length >= 12 && length <= 10240) {
+			if ((u8)buf[4] == 0x00 && (u8)buf[5] == 0x03 &&
+			    (u8)buf[6] == 0x00 && (u8)buf[7] == 0x00) {
+				// Verify key starts with alpha chars
+				if ((u8)buf[8] >= 'A' && (u8)buf[9] >= 'A' &&
+				    (u8)buf[10] >= 'A')
+					return MSG_REQUEST;
+			}
+		}
 	}
 
-	// ── DNS (over TCP): 2-byte length + header ──
-	if (len >= 12) {
-		u16 dns_len = ((u16)b0 << 8) | b1;
-		u8 flags_hi = (u8)msg[4];
-		u8 opcode   = (flags_hi >> 3) & 0x0F;
-		u16 qdcount = ((u16)(u8)msg[6] << 8) | (u8)msg[7];
-		if (dns_len >= 12 && dns_len < 4096 &&
-		    opcode <= 2 && qdcount >= 1 && qdcount <= 16)
-			return PROTO_DNS;
+	// Query message: tag 'Q' + length
+	if (count >= 5 && (u8)buf[0] == 'Q') {
+		s32 len = read_big_endian_s32(buf + 1);
+		if (len >= 8 && len <= 30000)
+			return MSG_REQUEST;
 	}
 
-	// ── MongoDB: 4-byte LE length + reqID + respTo + opcode ──
-	if (len >= 16) {
-		u32 mlen = (u32)b0 | ((u32)b1 << 8) |
-			   ((u32)b2 << 16) | ((u32)b3 << 24);
-		u32 opcode = (u32)(u8)msg[12] | ((u32)(u8)msg[13] << 8) |
-			     ((u32)(u8)msg[14] << 16) | ((u32)(u8)msg[15] << 24);
-		if (mlen >= 16 && mlen <= 0x2000000 &&
-		    (opcode == 1 || opcode == 2004 || opcode == 2013))
-			return PROTO_MONGO;
+	return MSG_UNKNOWN;
+}
+
+// MySQL (Pixie: infer_mysql_message — with conn_state for split reads)
+static __noinline u8 infer_mysql(const char *buf, u32 count,
+				 struct conn_state_t *cs)
+{
+	u8 use_prev = 0;
+	if (cs && cs->prev_count == 4) {
+		u32 expected = (u32)(u8)cs->prev_buf[0] |
+			       ((u32)(u8)cs->prev_buf[1] << 8) |
+			       ((u32)(u8)cs->prev_buf[2] << 16);
+		if (expected == count)
+			use_prev = 1;
 	}
 
-	// ── Kafka: 4-byte BE length + 2-byte API key + 2-byte version ──
-	if (len >= 8) {
-		u32 klen = ((u32)b0 << 24) | ((u32)b1 << 16) |
-			   ((u32)b2 << 8) | (u32)b3;
-		u16 api_key = ((u16)(u8)msg[4] << 8) | (u8)msg[5];
-		u16 api_ver = ((u16)(u8)msg[6] << 8) | (u8)msg[7];
-		if (klen >= 4 && klen <= 0x6400000 &&
-		    api_key <= 67 && api_ver <= 15)
-			return PROTO_KAFKA;
+	u32 total = use_prev ? count + 4 : count;
+	if (total < 5)
+		return MSG_UNKNOWN;
+
+	u32 len;
+	u8 seq, com;
+
+	if (use_prev) {
+		len = (u32)(u8)cs->prev_buf[0] |
+		      ((u32)(u8)cs->prev_buf[1] << 8) |
+		      ((u32)(u8)cs->prev_buf[2] << 16);
+		seq = (u8)cs->prev_buf[3];
+		com = (u8)buf[0];
+	} else {
+		len = (u32)(u8)buf[0] | ((u32)(u8)buf[1] << 8) |
+		      ((u32)(u8)buf[2] << 16);
+		seq = (u8)buf[3];
+		com = (u8)buf[4];
 	}
 
-	return PROTO_UNKNOWN;
+	if (seq != 0)
+		return MSG_UNKNOWN;
+	if (len == 0 || len > 10000)
+		return MSG_UNKNOWN;
+
+	// COM_QUERY(3), COM_CONNECT(0x0b), COM_STMT_PREPARE(0x16),
+	// COM_STMT_EXECUTE(0x17), COM_STMT_CLOSE(0x19)
+	if (com == 0x03 || com == 0x0b || com == 0x16 ||
+	    com == 0x17 || com == 0x19)
+		return MSG_REQUEST;
+
+	return MSG_UNKNOWN;
+}
+
+// Kafka (Pixie: infer_kafka_message — with conn_state for split reads)
+static __noinline u8 infer_kafka(const char *buf, u32 count,
+				 struct conn_state_t *cs)
+{
+	u8 use_prev = 0;
+	if (cs && cs->prev_count == 4) {
+		s32 expected = read_big_endian_s32(cs->prev_buf);
+		if (expected > 0 && (u32)expected == count)
+			use_prev = 1;
+	}
+
+	u32 total = use_prev ? count + 4 : count;
+	if (total < 12)
+		return MSG_UNKNOWN;
+
+	s32 msg_size;
+	const char *req_buf;
+
+	if (use_prev) {
+		msg_size = (s32)total;
+		req_buf = buf;
+	} else {
+		msg_size = read_big_endian_s32(buf) + 4;
+		req_buf = buf + 4;
+	}
+
+	if (msg_size < 0 || (u32)msg_size != total)
+		return MSG_UNKNOWN;
+
+	s16 api_key = read_big_endian_s16(req_buf);
+	s16 api_ver = read_big_endian_s16(req_buf + 2);
+	s32 corr_id = read_big_endian_s32(req_buf + 4);
+
+	if (api_key < 0 || api_key > 62)
+		return MSG_UNKNOWN;
+	if (api_ver < 0 || api_ver > 12)
+		return MSG_UNKNOWN;
+	if (corr_id < 0)
+		return MSG_UNKNOWN;
+
+	return MSG_REQUEST;
+}
+
+// AMQP (Pixie: infer_amqp_message)
+static __noinline u8 infer_amqp(const char *buf, u32 count)
+{
+	if (count < 8)
+		return MSG_UNKNOWN;
+
+	u8 frame_type = (u8)buf[0];
+	if (frame_type != 1) // Method frame
+		return MSG_UNKNOWN;
+
+	s16 class_id  = read_big_endian_s16(buf + 7);
+	s16 method_id = read_big_endian_s16(buf + 9);
+
+	// Connection.Start / Connection.StartOk
+	if (class_id == 10 && method_id == 10)
+		return MSG_REQUEST;
+	if (class_id == 10 && method_id == 11)
+		return MSG_RESPONSE;
+	// Basic.Publish / Basic.Deliver
+	if (class_id == 60 && method_id == 40)
+		return MSG_REQUEST;
+	if (class_id == 60 && method_id == 60)
+		return MSG_RESPONSE;
+
+	return MSG_UNKNOWN;
+}
+
+// DNS (Pixie: infer_dns_message)
+static __noinline u8 infer_dns(const char *buf, u32 count)
+{
+	if (count < 12 || count > 512)
+		return MSG_UNKNOWN;
+
+	u16 flags       = ((u16)(u8)buf[2] << 8) | (u8)buf[3];
+	u16 num_questions = ((u16)(u8)buf[4] << 8) | (u8)buf[5];
+	u16 num_answers = ((u16)(u8)buf[6] << 8) | (u8)buf[7];
+	u16 num_auth    = ((u16)(u8)buf[8] << 8) | (u8)buf[9];
+	u16 num_addl    = ((u16)(u8)buf[10] << 8) | (u8)buf[11];
+
+	u8 qr     = (flags >> 15) & 0x1;
+	u8 opcode = (flags >> 11) & 0xf;
+	u8 zero   = (flags >> 6) & 0x1;
+
+	if (zero != 0)
+		return MSG_UNKNOWN;
+	if (opcode != 0)
+		return MSG_UNKNOWN;
+	if (num_questions == 0 || num_questions > 10)
+		return MSG_UNKNOWN;
+
+	u32 num_rr = num_questions + num_answers + num_auth + num_addl;
+	if (num_rr > 25)
+		return MSG_UNKNOWN;
+
+	return qr == 0 ? MSG_REQUEST : MSG_RESPONSE;
+}
+
+// Redis (Pixie: is_redis_message)
+static __noinline u8 infer_redis(const char *buf, u32 count)
+{
+	if (count < 3 || count > PROBE_BUF_SIZE)
+		return MSG_UNKNOWN;
+
+	u8 first = (u8)buf[0];
+	if (first != '+' && first != '-' && first != ':' &&
+	    first != '$' && first != '*')
+		return MSG_UNKNOWN;
+
+	// Verify \r\n terminal sequence (bound index for verifier)
+	u32 idx = (count - 2) & (PROBE_BUF_SIZE - 1);
+	if ((u8)buf[idx] != '\r' || (u8)buf[idx + 1] != '\n')
+		return MSG_UNKNOWN;
+
+	// Redis can't distinguish request/response without parsing
+	return MSG_REQUEST; // placeholder — direction tells the real story
+}
+
+// NATS (Pixie: infer_nats_message)
+static __noinline u8 infer_nats(const char *buf, u32 count)
+{
+	if (count < 3 || count > PROBE_BUF_SIZE)
+		return MSG_UNKNOWN;
+
+	// Verify \r\n terminal sequence (bound index for verifier)
+	u32 idx = (count - 2) & (PROBE_BUF_SIZE - 1);
+	if ((u8)buf[idx] != '\r' || (u8)buf[idx + 1] != '\n')
+		return MSG_UNKNOWN;
+
+	// Client commands
+	if (buf[0] == 'C' && buf[1] == 'O' && buf[2] == 'N' &&
+	    buf[3] == 'N' && buf[4] == 'E' && buf[5] == 'C' && buf[6] == 'T')
+		return MSG_REQUEST;
+	if (buf[0] == 'S' && buf[1] == 'U' && buf[2] == 'B')
+		return MSG_REQUEST;
+	if (buf[0] == 'U' && buf[1] == 'N' && buf[2] == 'S' &&
+	    buf[3] == 'U' && buf[4] == 'B')
+		return MSG_REQUEST;
+	if (buf[0] == 'P' && buf[1] == 'U' && buf[2] == 'B')
+		return MSG_REQUEST;
+
+	// Server commands
+	if (buf[0] == 'I' && buf[1] == 'N' && buf[2] == 'F' && buf[3] == 'O')
+		return MSG_RESPONSE;
+	if (buf[0] == 'M' && buf[1] == 'S' && buf[2] == 'G')
+		return MSG_RESPONSE;
+	if (buf[0] == '+' && buf[1] == 'O' && buf[2] == 'K')
+		return MSG_RESPONSE;
+	if (buf[0] == '-' && buf[1] == 'E' && buf[2] == 'R' && buf[3] == 'R')
+		return MSG_RESPONSE;
+
+	return MSG_UNKNOWN;
+}
+
+// Mux (Pixie: infer_mux_message)
+static __noinline u8 infer_mux(const char *buf, u32 count)
+{
+	if (count < 8)
+		return MSG_UNKNOWN;
+
+	s32 type_and_tag = read_big_endian_s32(buf + 4);
+	s8 mtype = (s8)((type_and_tag >> 24) & 0xff);
+	u32 tag = type_and_tag & 0xffffff;
+
+	u8 result;
+	switch (mtype) {
+	case 2:   // Tdispatch
+	case 68:  // Tinit
+	case 127: // RerrOld
+		result = MSG_REQUEST;
+		break;
+	case -2:   // Rdispatch
+	case -68:  // Rinit
+	case -128: // Rerr
+		result = MSG_RESPONSE;
+		break;
+	default:
+		return MSG_UNKNOWN;
+	}
+
+	if (tag < 1 || tag > ((1 << 23) - 1))
+		return MSG_UNKNOWN;
+
+	// Tinit/Rinit: verify "mux-framer" string at offset 14
+	if (mtype == 68 || mtype == -68) {
+		if (count < 24)
+			return MSG_UNKNOWN;
+		if (buf[14] != 'm' || buf[15] != 'u' || buf[16] != 'x' ||
+		    buf[17] != '-' || buf[18] != 'f' || buf[19] != 'r' ||
+		    buf[20] != 'a' || buf[21] != 'm' || buf[22] != 'e' ||
+		    buf[23] != 'r')
+			return MSG_UNKNOWN;
+	}
+
+	// Tdispatch: verify "com.twitter" context key at offset 12
+	if (mtype == 2) {
+		if (count < 23)
+			return MSG_UNKNOWN;
+		if (buf[12] != 'c' || buf[13] != 'o' || buf[14] != 'm' ||
+		    buf[15] != '.' || buf[16] != 't' || buf[17] != 'w' ||
+		    buf[18] != 'i' || buf[19] != 't' || buf[20] != 't' ||
+		    buf[21] != 'e' || buf[22] != 'r')
+			return MSG_UNKNOWN;
+	}
+
+	// Rdispatch: verify reply status
+	if (mtype == -2) {
+		u8 status = (u8)buf[8];
+		if (status > 2) // 0=Ok, 1=Error, 2=Nack
+			return MSG_UNKNOWN;
+	}
+
+	return result;
+}
+
+// ─── Master protocol inference (Pixie infer_protocol order) ─────
+
+struct infer_result_t {
+	u8 protocol;
+	u8 msg_type;
+};
+
+static __always_inline struct infer_result_t infer_protocol(
+	const char *buf, u32 count, struct conn_state_t *cs)
+{
+	struct infer_result_t r = {PROTO_UNKNOWN, MSG_UNKNOWN};
+	u8 t;
+
+	// Order matches Pixie: TLS → HTTP → CQL → Mongo → PgSQL →
+	//                      MySQL → Mux → Kafka → DNS → AMQP → Redis → NATS
+
+	if ((t = infer_tls(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_TLS; r.msg_type = t; return r;
+	}
+	if ((t = infer_http(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_HTTP; r.msg_type = t; return r;
+	}
+	if ((t = infer_cql(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_CQL; r.msg_type = t; return r;
+	}
+	if ((t = infer_mongo(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_MONGO; r.msg_type = t; return r;
+	}
+	if ((t = infer_pgsql(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_PGSQL; r.msg_type = t; return r;
+	}
+	if ((t = infer_mysql(buf, count, cs)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_MYSQL; r.msg_type = t; return r;
+	}
+	if ((t = infer_mux(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_MUX; r.msg_type = t; return r;
+	}
+	if ((t = infer_kafka(buf, count, cs)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_KAFKA; r.msg_type = t; return r;
+	}
+	if ((t = infer_dns(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_DNS; r.msg_type = t; return r;
+	}
+	if ((t = infer_amqp(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_AMQP; r.msg_type = t; return r;
+	}
+	if (infer_redis(buf, count) != MSG_UNKNOWN) {
+		r.protocol = PROTO_REDIS; r.msg_type = MSG_UNKNOWN; return r;
+	}
+	if ((t = infer_nats(buf, count)) != MSG_UNKNOWN) {
+		r.protocol = PROTO_NATS; r.msg_type = t; return r;
+	}
+
+	return r;
 }
 
 // ─── Emit helper ────────────────────────────────────────────────
 
 static __always_inline int emit_event(struct args_t *a, long bytes, u8 direction)
 {
-	struct data_event_t *event;
+	u64 id  = bpf_get_current_pid_tgid();
+	u32 pid = id >> 32;
+	u64 conn_key = ((u64)pid << 32) | (u32)a->fd;
 
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	// ── Phase 1: protocol inference on a small stack buffer ──
+	// This keeps all inference branches OUTSIDE the ringbuf alloc window
+	// so the verifier can track the alloc_mem pointer without blowing up.
+	char probe[PROBE_BUF_SIZE];
+	__builtin_memset(probe, 0, PROBE_BUF_SIZE);
+	u32 probe_len = (u32)bytes;
+	if (probe_len >= PROBE_BUF_SIZE)
+		probe_len = PROBE_BUF_SIZE - 1;
+	probe_len &= (PROBE_BUF_SIZE - 1); // verifier: prove max 63
+	bpf_probe_read_user(probe, probe_len + 1, (void *)a->buf);
+
+	struct conn_state_t *cs = bpf_map_lookup_elem(&conn_state, &conn_key);
+
+	u8 proto;
+	u8 mtype;
+
+	if (cs && cs->protocol != PROTO_UNKNOWN) {
+		proto = cs->protocol;
+		mtype = MSG_UNKNOWN;
+	} else {
+		struct infer_result_t r = infer_protocol(probe, probe_len, cs);
+		proto = r.protocol;
+		mtype = r.msg_type;
+
+		if (r.protocol != PROTO_UNKNOWN) {
+			struct conn_state_t new_cs = {};
+			new_cs.protocol = r.protocol;
+			bpf_map_update_elem(&conn_state, &conn_key, &new_cs, BPF_ANY);
+		}
+	}
+
+	// Save prev_buf for MySQL/Kafka split-read detection
+	if (probe_len == 4 && cs == 0) {
+		struct conn_state_t new_cs = {};
+		new_cs.prev_count = 4;
+		new_cs.prev_buf[0] = probe[0];
+		new_cs.prev_buf[1] = probe[1];
+		new_cs.prev_buf[2] = probe[2];
+		new_cs.prev_buf[3] = probe[3];
+		bpf_map_update_elem(&conn_state, &conn_key, &new_cs, BPF_ANY);
+	} else if (cs) {
+		struct conn_state_t new_cs = {};
+		new_cs.protocol = cs->protocol;
+		new_cs.prev_count = 0;
+		bpf_map_update_elem(&conn_state, &conn_key, &new_cs, BPF_ANY);
+	}
+
+	// ── Phase 2: ringbuf reserve + payload copy (simple, verifier-friendly) ──
+	struct data_event_t *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 0;
 
-	u64 id = bpf_get_current_pid_tgid();
 	event->timestamp_ns = bpf_ktime_get_ns();
-	event->pid = id >> 32;
-	event->fd = a->fd;
+	event->pid       = pid;
+	event->fd        = a->fd;
 	event->direction = direction;
-	event->msg_size = (u32)bytes;
+	event->msg_size  = (u32)bytes;
+	event->protocol  = proto;
+	event->msg_type  = mtype;
 	bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-	// Clamp read size for verifier
 	u32 copy = (u32)bytes;
 	if (copy > MAX_MSG_SIZE)
 		copy = MAX_MSG_SIZE;
-	// Bitmask ensures verifier can prove bound (MAX_MSG_SIZE is power of 2)
 	copy &= (MAX_MSG_SIZE - 1);
 	bpf_probe_read_user(&event->msg, copy + 1, (void *)a->buf);
-
-	event->protocol = detect_protocol(event->msg, copy);
 
 	bpf_ringbuf_submit(event, 0);
 	return 0;
@@ -443,7 +814,6 @@ int tp_sys_enter_sendto(struct trace_event_raw_sys_enter *ctx)
 	u32 pid = id >> 32;
 	int fd  = (int)ctx->args[0];
 
-	// sendto is always on a socket — auto-mark
 	u64 sock_key = ((u64)pid << 32) | (u32)fd;
 	u8 val = 1;
 	bpf_map_update_elem(&socket_fds, &sock_key, &val, BPF_ANY);
@@ -480,7 +850,6 @@ int tp_sys_enter_recvfrom(struct trace_event_raw_sys_enter *ctx)
 	u32 pid = id >> 32;
 	int fd  = (int)ctx->args[0];
 
-	// recvfrom is always on a socket — auto-mark
 	u64 sock_key = ((u64)pid << 32) | (u32)fd;
 	u8 val = 1;
 	bpf_map_update_elem(&socket_fds, &sock_key, &val, BPF_ANY);
@@ -508,7 +877,7 @@ int tp_sys_exit_recvfrom(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-// ─── close (cleanup socket_fds) ─────────────────────────────────
+// ─── close (cleanup) ────────────────────────────────────────────
 
 SEC("tracepoint/syscalls/sys_enter_close")
 int tp_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
@@ -519,6 +888,7 @@ int tp_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
 
 	u64 key = ((u64)pid << 32) | (u32)fd;
 	bpf_map_delete_elem(&socket_fds, &key);
+	bpf_map_delete_elem(&conn_state, &key);
 	return 0;
 }
 
