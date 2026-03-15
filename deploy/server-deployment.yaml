@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nefi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nefi-server
+  namespace: nefi
+spec:
+  selector:
+    app: nefi-server
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nefi-server
+  namespace: nefi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nefi-server
+  template:
+    metadata:
+      labels:
+        app: nefi-server
+    spec:
+      containers:
+        - name: nefi-server
+          image: ghcr.io/gihongjo/nefi-server:latest
+          args:
+            - --grpc-addr=:9090
+            - --http-addr=:8080
+          ports:
+            - containerPort: 9090
+              name: grpc
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

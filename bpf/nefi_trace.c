@@ -7,6 +7,15 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
+// byte order helpers — bpf_endian.h가 없는 환경을 위한 fallback
+// __builtin_bswap*는 clang이 항상 인라인으로 처리하므로 BPF verifier 거부 없음
+#ifndef bpf_ntohl
+#define bpf_ntohl(x) __builtin_bswap32(x)
+#define bpf_ntohs(x) __builtin_bswap16(x)
+#define bpf_htonl(x) __builtin_bswap32(x)
+#define bpf_htons(x) __builtin_bswap16(x)
+#endif
+
 typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
@@ -18,6 +27,16 @@ typedef short          s16;
 
 #define MAX_MSG_SIZE 4096
 #define PROBE_BUF_SIZE 64
+#define AF_INET 2
+
+// ─── Network address structs ────────────────────────────────────
+
+struct sockaddr_in {
+	u16 sin_family;
+	u16 sin_port;   // network byte order
+	u32 sin_addr;   // network byte order
+	u8  sin_zero[8];
+};
 
 // ─── Tracepoint context structs ─────────────────────────────────
 
@@ -75,12 +94,27 @@ struct data_event_t {
 	u8   protocol;
 	u8   msg_type;  // 0 = unknown, 1 = request, 2 = response
 	char comm[16];
+	u32  remote_ip;   // host byte order (bpf_ntohl applied)
+	u16  remote_port; // host byte order (bpf_ntohs applied)
+	u16  _pad;
 	char msg[MAX_MSG_SIZE];
 } __attribute__((packed));
 
 struct args_t {
 	u64 buf; // userspace buffer pointer
 	u32 fd;
+};
+
+// Per-connection remote endpoint info (populated on accept/connect).
+struct conn_info_t {
+	u32 remote_ip;   // host byte order
+	u16 remote_port; // host byte order
+	u16 _pad;
+};
+
+// Saved sockaddr pointer across accept4/accept enter→exit.
+struct accept_args_t {
+	u64 sockaddr_ptr;
 };
 
 // Per-connection state for stateful protocol detection (MySQL, Kafka).
@@ -106,14 +140,14 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, 65536);
 	__type(key, u64); // pid_tgid
 	__type(value, struct args_t);
 } active_send_args SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, 65536);
 	__type(key, u64);
 	__type(value, struct args_t);
 } active_recv_args SEC(".maps");
@@ -125,6 +159,22 @@ struct {
 	__type(key, u64);  // pid<<32 | fd
 	__type(value, struct conn_state_t);
 } conn_state SEC(".maps");
+
+// Remote endpoint info per connection.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);  // pid<<32 | fd
+	__type(value, struct conn_info_t);
+} conn_info SEC(".maps");
+
+// Saves sockaddr pointer from accept4/accept enter for use in exit.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);  // pid_tgid
+	__type(value, struct accept_args_t);
+} active_accept_args SEC(".maps");
 
 // ─── Helpers (ported from Pixie bpf_tools/utils.h) ──────────────
 
@@ -686,6 +736,16 @@ static __always_inline int emit_event(struct args_t *a, long bytes, u8 direction
 	event->msg_type  = mtype;
 	bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
+	struct conn_info_t *ci = bpf_map_lookup_elem(&conn_info, &conn_key);
+	if (ci) {
+		event->remote_ip   = ci->remote_ip;
+		event->remote_port = ci->remote_port;
+	} else {
+		event->remote_ip   = 0;
+		event->remote_port = 0;
+	}
+	event->_pad = 0;
+
 	u32 copy = (u32)bytes;
 	if (copy > MAX_MSG_SIZE)
 		copy = MAX_MSG_SIZE;
@@ -708,6 +768,30 @@ int tp_sys_enter_connect(struct trace_event_raw_sys_enter *ctx)
 	u64 key = ((u64)pid << 32) | (u32)fd;
 	u8 val  = 1;
 	bpf_map_update_elem(&socket_fds, &key, &val, BPF_ANY);
+
+	// Extract remote IP/port from sockaddr_in.
+	u64 addr_ptr = ctx->args[1];
+	if (addr_ptr) {
+		struct sockaddr_in sa = {};
+		bpf_probe_read_user(&sa, sizeof(sa), (void *)addr_ptr);
+		if (sa.sin_family == AF_INET) {
+			struct conn_info_t ci = {};
+			ci.remote_ip   = bpf_ntohl(sa.sin_addr);
+			ci.remote_port = bpf_ntohs(sa.sin_port);
+			bpf_map_update_elem(&conn_info, &key, &ci, BPF_ANY);
+		}
+	}
+	return 0;
+}
+
+// accept4 enter: save sockaddr pointer for exit handler.
+SEC("tracepoint/syscalls/sys_enter_accept4")
+int tp_sys_enter_accept4(struct trace_event_raw_sys_enter *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	struct accept_args_t a = {};
+	a.sockaddr_ptr = ctx->args[1]; // struct sockaddr *addr (output param)
+	bpf_map_update_elem(&active_accept_args, &id, &a, BPF_ANY);
 	return 0;
 }
 
@@ -715,15 +799,73 @@ SEC("tracepoint/syscalls/sys_exit_accept4")
 int tp_sys_exit_accept4(struct trace_event_raw_sys_exit *ctx)
 {
 	long fd = ctx->ret;
-	if (fd < 0)
-		return 0;
-
 	u64 id  = bpf_get_current_pid_tgid();
-	u32 pid = id >> 32;
 
+	if (fd < 0) {
+		bpf_map_delete_elem(&active_accept_args, &id);
+		return 0;
+	}
+
+	u32 pid = id >> 32;
 	u64 key = ((u64)pid << 32) | (u32)fd;
 	u8 val  = 1;
 	bpf_map_update_elem(&socket_fds, &key, &val, BPF_ANY);
+
+	// Read remote addr written by kernel into the sockaddr output param.
+	struct accept_args_t *aa = bpf_map_lookup_elem(&active_accept_args, &id);
+	if (aa && aa->sockaddr_ptr) {
+		struct sockaddr_in sa = {};
+		bpf_probe_read_user(&sa, sizeof(sa), (void *)aa->sockaddr_ptr);
+		if (sa.sin_family == AF_INET) {
+			struct conn_info_t ci = {};
+			ci.remote_ip   = bpf_ntohl(sa.sin_addr);
+			ci.remote_port = bpf_ntohs(sa.sin_port);
+			bpf_map_update_elem(&conn_info, &key, &ci, BPF_ANY);
+		}
+	}
+	bpf_map_delete_elem(&active_accept_args, &id);
+	return 0;
+}
+
+// accept (legacy syscall) — some JVM versions use accept() instead of accept4()
+SEC("tracepoint/syscalls/sys_enter_accept")
+int tp_sys_enter_accept(struct trace_event_raw_sys_enter *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	struct accept_args_t a = {};
+	a.sockaddr_ptr = ctx->args[1];
+	bpf_map_update_elem(&active_accept_args, &id, &a, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_accept")
+int tp_sys_exit_accept(struct trace_event_raw_sys_exit *ctx)
+{
+	long fd = ctx->ret;
+	u64 id  = bpf_get_current_pid_tgid();
+
+	if (fd < 0) {
+		bpf_map_delete_elem(&active_accept_args, &id);
+		return 0;
+	}
+
+	u32 pid = id >> 32;
+	u64 key = ((u64)pid << 32) | (u32)fd;
+	u8 val  = 1;
+	bpf_map_update_elem(&socket_fds, &key, &val, BPF_ANY);
+
+	struct accept_args_t *aa = bpf_map_lookup_elem(&active_accept_args, &id);
+	if (aa && aa->sockaddr_ptr) {
+		struct sockaddr_in sa = {};
+		bpf_probe_read_user(&sa, sizeof(sa), (void *)aa->sockaddr_ptr);
+		if (sa.sin_family == AF_INET) {
+			struct conn_info_t ci = {};
+			ci.remote_ip   = bpf_ntohl(sa.sin_addr);
+			ci.remote_port = bpf_ntohs(sa.sin_port);
+			bpf_map_update_elem(&conn_info, &key, &ci, BPF_ANY);
+		}
+	}
+	bpf_map_delete_elem(&active_accept_args, &id);
 	return 0;
 }
 
@@ -877,6 +1019,116 @@ int tp_sys_exit_recvfrom(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
+// ─── recvmsg ─────────────────────────────────────────────────────
+// Java NIO (Tomcat/Spring Boot) may use recvmsg() instead of read()
+// for reading from accepted sockets. struct msghdr layout (64-bit):
+//   offset  0: void *msg_name   (8 bytes)
+//   offset  8: int   msg_namelen (4 bytes) + 4 bytes padding
+//   offset 16: struct iovec *msg_iov (8 bytes)  ← we need this
+//   offset 24: size_t msg_iovlen
+// struct iovec layout:
+//   offset 0: void *iov_base (8 bytes)  ← actual buffer pointer
+//   offset 8: size_t iov_len
+
+SEC("tracepoint/syscalls/sys_enter_recvmsg")
+int tp_sys_enter_recvmsg(struct trace_event_raw_sys_enter *ctx)
+{
+	u64 id  = bpf_get_current_pid_tgid();
+	u32 pid = id >> 32;
+	int fd  = (int)ctx->args[0];
+
+	if (fd <= 2)
+		return 0;
+
+	u64 sock_key = ((u64)pid << 32) | (u32)fd;
+	if (!bpf_map_lookup_elem(&socket_fds, &sock_key))
+		return 0;
+
+	// Read msg_iov pointer from msghdr at offset 16.
+	u64 msghdr_ptr = ctx->args[1];
+	u64 iov_ptr    = 0;
+	bpf_probe_read_user(&iov_ptr, sizeof(iov_ptr),
+	                    (void *)(msghdr_ptr + 16));
+	if (!iov_ptr)
+		return 0;
+
+	// Read iov_base (first iovec, offset 0).
+	u64 buf = 0;
+	bpf_probe_read_user(&buf, sizeof(buf), (void *)iov_ptr);
+	if (!buf)
+		return 0;
+
+	struct args_t a = {};
+	a.buf = buf;
+	a.fd  = (u32)fd;
+	bpf_map_update_elem(&active_recv_args, &id, &a, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_recvmsg")
+int tp_sys_exit_recvmsg(struct trace_event_raw_sys_exit *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	struct args_t *a = bpf_map_lookup_elem(&active_recv_args, &id);
+	if (!a)
+		return 0;
+
+	long ret = ctx->ret;
+	if (ret > 0)
+		emit_event(a, ret, 1);
+
+	bpf_map_delete_elem(&active_recv_args, &id);
+	return 0;
+}
+
+// ─── readv ───────────────────────────────────────────────────────
+// Java NIO may use readv() (scatter-gather read) for socket I/O.
+// We capture iovec[0].iov_base as the buffer pointer.
+
+SEC("tracepoint/syscalls/sys_enter_readv")
+int tp_sys_enter_readv(struct trace_event_raw_sys_enter *ctx)
+{
+	u64 id  = bpf_get_current_pid_tgid();
+	u32 pid = id >> 32;
+	int fd  = (int)ctx->args[0];
+
+	if (fd <= 2)
+		return 0;
+
+	u64 sock_key = ((u64)pid << 32) | (u32)fd;
+	if (!bpf_map_lookup_elem(&socket_fds, &sock_key))
+		return 0;
+
+	// iovec[0].iov_base is at offset 0 of the first iovec.
+	u64 iov_ptr = ctx->args[1];
+	u64 buf     = 0;
+	bpf_probe_read_user(&buf, sizeof(buf), (void *)iov_ptr);
+	if (!buf)
+		return 0;
+
+	struct args_t a = {};
+	a.buf = buf;
+	a.fd  = (u32)fd;
+	bpf_map_update_elem(&active_recv_args, &id, &a, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_readv")
+int tp_sys_exit_readv(struct trace_event_raw_sys_exit *ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	struct args_t *a = bpf_map_lookup_elem(&active_recv_args, &id);
+	if (!a)
+		return 0;
+
+	long ret = ctx->ret;
+	if (ret > 0)
+		emit_event(a, ret, 1);
+
+	bpf_map_delete_elem(&active_recv_args, &id);
+	return 0;
+}
+
 // ─── close (cleanup) ────────────────────────────────────────────
 
 SEC("tracepoint/syscalls/sys_enter_close")
@@ -889,6 +1141,7 @@ int tp_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
 	u64 key = ((u64)pid << 32) | (u32)fd;
 	bpf_map_delete_elem(&socket_fds, &key);
 	bpf_map_delete_elem(&conn_state, &key);
+	bpf_map_delete_elem(&conn_info, &key);
 	return 0;
 }
 

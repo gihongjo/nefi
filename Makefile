@@ -1,5 +1,8 @@
 .PHONY: agent agent-deploy agent-logs agent-clean \
-       bcc-test bcc-test-deploy bcc-test-logs bcc-test-clean help
+        agent-enable-node agent-disable-node \
+        server server-deploy server-logs server-clean \
+        proto \
+        bcc-test bcc-test-deploy bcc-test-logs bcc-test-clean help
 
 REGISTRY ?= ghcr.io/gihongjo
 
@@ -7,18 +10,56 @@ REGISTRY ?= ghcr.io/gihongjo
 
 agent:
 	docker build -f Dockerfile.agent -t $(REGISTRY)/nefi-agent:latest .
+	docker push $(REGISTRY)/nefi-agent:latest
 
 agent-deploy: agent
 	docker push $(REGISTRY)/nefi-agent:latest
-	-kubectl delete pod nefi-agent-test -n nefi --ignore-not-found
 	kubectl create namespace nefi --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -f deploy/agent-test-pod.yaml
+	kubectl delete daemonset nefi-agent -n nefi --ignore-not-found
+	kubectl apply -f deploy/agent-daemonset.yaml
 
 agent-logs:
-	kubectl logs -n nefi nefi-agent-test -f
+	kubectl logs -n nefi -l app=nefi-agent -f --max-log-requests=20
 
 agent-clean:
-	kubectl delete pod nefi-agent-test -n nefi --ignore-not-found
+	kubectl delete daemonset nefi-agent -n nefi --ignore-not-found
+
+## Node targeting — label a node to enable/disable the agent on it
+## Usage: make agent-enable-node NODE=worker1
+
+agent-enable-node:
+	kubectl label node $(NODE) nefi-agent=enabled --overwrite
+
+agent-disable-node:
+	kubectl label node $(NODE) nefi-agent-
+
+## Server
+
+server:
+	docker build -f Dockerfile.server -t $(REGISTRY)/nefi-server:latest .
+	docker push $(REGISTRY)/nefi-server:latest
+
+server-deploy: server
+	kubectl create namespace nefi --dry-run=client -o yaml | kubectl apply -f -
+	kubectl delete deployment nefi-server -n nefi --ignore-not-found
+	kubectl apply -f deploy/server-deployment.yaml
+
+server-logs:
+	kubectl logs -n nefi -l app=nefi-server -f
+
+server-clean:
+	kubectl delete deployment nefi-server -n nefi --ignore-not-found
+
+## Proto (macOS 로컬에서 실행, protoc + protoc-gen-go + protoc-gen-go-grpc 필요)
+
+proto:
+	protoc \
+	  --proto_path=proto \
+	  --go_out=gen/go \
+	  --go_opt=paths=source_relative \
+	  --go-grpc_out=gen/go \
+	  --go-grpc_opt=paths=source_relative \
+	  nefi/v1/events.proto nefi/v1/collector.proto
 
 ## BCC Test
 
@@ -40,13 +81,24 @@ bcc-test-clean:
 ## Help
 
 help:
-	@echo "nefi - eBPF Data Engineering Tool"
+	@echo "nefi - eBPF Network Tracing"
 	@echo ""
 	@echo "Agent (libbpf/CO-RE):"
-	@echo "  make agent            Build agent image"
-	@echo "  make agent-deploy     Build, push, and deploy agent pod"
-	@echo "  make agent-logs       Follow agent pod logs"
-	@echo "  make agent-clean      Delete agent pod"
+	@echo "  make agent                       Build agent image"
+	@echo "  make agent-deploy                Build, push, and deploy DaemonSet"
+	@echo "  make agent-logs                  Follow logs from all agent pods"
+	@echo "  make agent-clean                 Delete DaemonSet"
+	@echo "  make agent-enable-node NODE=X    Deploy agent to node X"
+	@echo "  make agent-disable-node NODE=X   Remove agent from node X"
+	@echo ""
+	@echo "Server:"
+	@echo "  make server                      Build server image"
+	@echo "  make server-deploy               Build, push, and deploy Deployment"
+	@echo "  make server-logs                 Follow server logs"
+	@echo "  make server-clean                Delete Deployment"
+	@echo ""
+	@echo "Proto:"
+	@echo "  make proto                       Regenerate Go code from .proto files"
 	@echo ""
 	@echo "BCC Test:"
 	@echo "  make bcc-test         Build BCC test image"

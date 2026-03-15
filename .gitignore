@@ -1,21 +1,44 @@
-# Binaries
-bin/
-*.o
-*.exe
+# ── 빌드 산출물 ──────────────────────────────────────────
+# 루트 레벨 바이너리 (make server, make agent 결과물)
+/nefi-server
+/nefi-agent
 
-# Go
+# BPF 오브젝트 파일 (bpf2go 중간 산출물)
+# .go 생성 파일(nefitrace_*_bpfel.go)은 커밋됨 — .o 파일만 제외
+*.o
+
+# 일반 Go 빌드 출력
+bin/
+*.exe
+*.out
+
+# ── Go 도구 ───────────────────────────────────────────────
 vendor/
 
-# IDE
+# 테스트 커버리지
+coverage.*
+*.coverprofile
+
+# ── IDE / 에디터 ──────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
+*.iml
 
-# OS
+# ── OS ────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Build
-*.out
-coverage.*
+# ── 환경 설정 (시크릿 포함 가능) ─────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ── 임시/로컬 파일 ────────────────────────────────────────
+*.log
+tmp/
+*claude

@@ -1,3 +1,29 @@
+// Package ebpf는 BPF 프로그램의 로드, tracepoint attach, 이벤트 읽기를 담당한다.
+//
+// 역할 (loader.go):
+//   nefi_trace.c를 컴파일한 BPF 오브젝트를 커널에 로드하고,
+//   syscall tracepoint에 attach한 뒤 ringbuf에서 이벤트를 읽어 반환한다.
+//
+// 흐름:
+//   1. New() 호출
+//      → loadNefiTraceObjects(): BPF .o 파일을 커널에 로드
+//      → attach(): 각 syscall tracepoint에 BPF 프로그램 연결
+//         - connect/accept4  : 소켓 FD를 socket_fds 맵에 등록
+//         - write/read       : socket_fds에 있는 FD만 페이로드 캡처
+//         - sendto/recvfrom  : 자동 FD 등록 + 페이로드 캡처
+//         - close            : socket_fds 및 conn_state 정리
+//      → ringbuf.NewReader(): 커널 ringbuf 구독 시작
+//
+//   2. Read() 반복 호출 (main.go의 루프에서)
+//      → 커널이 이벤트를 ringbuf에 쓸 때까지 블로킹
+//      → 바이너리 데이터를 model.DataEvent 구조체로 역직렬화해서 반환
+//
+//   3. EventsMap()
+//      → ssl_loader.go(SSLLoader)가 같은 ringbuf를 공유하기 위해 맵을 가져감
+//         (uprobe 이벤트와 tracepoint 이벤트가 같은 루프에서 처리됨)
+//
+// 생성 파일 (go generate로 자동 생성, 커밋됨):
+//   nefitrace_arm64_bpfel.go  — arm64용 BPF 오브젝트 Go 래퍼
 package ebpf
 
 import (
@@ -14,9 +40,7 @@ import (
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target arm64 -cc clang -cflags "-O2 -g -Wall" nefiTrace ../../../bpf/nefi_trace.c
-
-// AMD64 로 배포 시.
-////go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -cc clang -cflags "-O2 -g -Wall" nefiTrace ../../../bpf/nefi_trace.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -cc clang -cflags "-O2 -g -Wall" nefiTrace ../../../bpf/nefi_trace.c
 
 // Loader manages the BPF program lifecycle: load, attach, read events.
 type Loader struct {
@@ -61,7 +85,10 @@ func (l *Loader) attach() error {
 	// e.g. tp_sys_enter_connect -> TpSysEnterConnect
 	entries := []entry{
 		{"syscalls", "sys_enter_connect", l.objs.TpSysEnterConnect},
+		{"syscalls", "sys_enter_accept4", l.objs.TpSysEnterAccept4},
 		{"syscalls", "sys_exit_accept4", l.objs.TpSysExitAccept4},
+		{"syscalls", "sys_enter_accept", l.objs.TpSysEnterAccept},
+		{"syscalls", "sys_exit_accept", l.objs.TpSysExitAccept},
 		{"syscalls", "sys_enter_write", l.objs.TpSysEnterWrite},
 		{"syscalls", "sys_exit_write", l.objs.TpSysExitWrite},
 		{"syscalls", "sys_enter_read", l.objs.TpSysEnterRead},
@@ -70,6 +97,12 @@ func (l *Loader) attach() error {
 		{"syscalls", "sys_exit_sendto", l.objs.TpSysExitSendto},
 		{"syscalls", "sys_enter_recvfrom", l.objs.TpSysEnterRecvfrom},
 		{"syscalls", "sys_exit_recvfrom", l.objs.TpSysExitRecvfrom},
+		// recvmsg: Java NIO (Tomcat/Spring Boot) may use this instead of read()
+		{"syscalls", "sys_enter_recvmsg", l.objs.TpSysEnterRecvmsg},
+		{"syscalls", "sys_exit_recvmsg", l.objs.TpSysExitRecvmsg},
+		// readv: scatter-gather read used by some Java NIO implementations
+		{"syscalls", "sys_enter_readv", l.objs.TpSysEnterReadv},
+		{"syscalls", "sys_exit_readv", l.objs.TpSysExitReadv},
 		{"syscalls", "sys_enter_close", l.objs.TpSysEnterClose},
 	}
 
@@ -102,6 +135,12 @@ func (l *Loader) Read() (*model.DataEvent, error) {
 		return nil, fmt.Errorf("parsing event: %w", err)
 	}
 	return &event, nil
+}
+
+// EventsMap returns the shared ring buffer map so that SSLLoader can route
+// uprobe events into the same reader loop as the tracepoint events.
+func (l *Loader) EventsMap() *ciliumebpf.Map {
+	return l.objs.Events
 }
 
 // Close releases all BPF resources.

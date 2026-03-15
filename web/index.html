@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nefi — API Success Rate</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; }
+    header { padding: 20px 32px; border-bottom: 1px solid #1e293b; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 500; }
+    .badge.connected { background: #14532d; color: #4ade80; }
+    .badge.disconnected { background: #450a0a; color: #f87171; }
+    .controls { display: flex; gap: 12px; padding: 20px 32px; align-items: flex-end; flex-wrap: wrap; }
+    label { font-size: 12px; color: #94a3b8; display: flex; flex-direction: column; gap: 4px; }
+    input, select {
+      background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+      border-radius: 6px; padding: 7px 12px; font-size: 14px; outline: none;
+    }
+    input:focus, select:focus { border-color: #6366f1; }
+    .main { padding: 0 32px 32px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 12px; color: #64748b; font-weight: 500; border-bottom: 1px solid #1e293b; white-space: nowrap; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1e293b; }
+    tr:hover td { background: #1e293b55; }
+    .method { font-family: monospace; font-weight: 600; font-size: 12px; padding: 2px 7px; border-radius: 4px; }
+    .method.GET    { background: #1e3a5f; color: #60a5fa; }
+    .method.POST   { background: #14532d; color: #4ade80; }
+    .method.PUT    { background: #451a03; color: #fb923c; }
+    .method.DELETE { background: #450a0a; color: #f87171; }
+    .method.PATCH  { background: #2e1065; color: #c084fc; }
+    .path { font-family: monospace; color: #cbd5e1; }
+    .rate-bar { display: flex; align-items: center; gap: 10px; }
+    .bar-bg { flex: 1; height: 6px; background: #1e293b; border-radius: 99px; overflow: hidden; max-width: 120px; }
+    .bar-fill { height: 100%; border-radius: 99px; transition: width 0.4s ease; }
+    .rate-text { font-weight: 600; font-size: 13px; min-width: 42px; text-align: right; }
+    .count { color: #64748b; font-size: 12px; }
+    .empty { text-align: center; padding: 60px; color: #475569; }
+    .summary { display: flex; gap: 16px; padding: 0 32px 20px; flex-wrap: wrap; }
+    .stat-card { background: #1e293b; border-radius: 8px; padding: 14px 20px; min-width: 140px; }
+    .stat-card .label { font-size: 11px; color: #64748b; margin-bottom: 4px; }
+    .stat-card .value { font-size: 22px; font-weight: 700; }
+    .green { color: #4ade80; }
+    .red   { color: #f87171; }
+    .yellow{ color: #facc15; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo } = React;
+
+function rateColor(rate) {
+  if (rate >= 95) return '#4ade80';
+  if (rate >= 80) return '#facc15';
+  return '#f87171';
+}
+
+const MAX_RETRIES = 10;
+
+function wsProtocol() {
+  return window.location.protocol === 'https:' ? 'wss' : 'ws';
+}
+
+function App() {
+  const [endpoints, setEndpoints] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [namespace, setNamespace] = useState('');
+  const [windowSec, setWindowSec] = useState(60);
+  const [serverAddr, setServerAddr] = useState(window.location.host);
+  const wsRef = useRef(null);
+  const retriesRef = useRef(0);
+
+  // WebSocket: 연결 및 실시간 stats 수신 (window=60 고정)
+  useEffect(() => {
+    retriesRef.current = 0;
+    connect(serverAddr);
+    return () => wsRef.current?.close();
+  }, [serverAddr]);
+
+  function connect(addr) {
+    if (wsRef.current) wsRef.current.close();
+    const ws = new WebSocket(`${wsProtocol()}://${addr}/ws`);
+    wsRef.current = ws;
+
+    ws.onopen = () => { setConnected(true); retriesRef.current = 0; };
+    ws.onclose = () => {
+      setConnected(false);
+      if (retriesRef.current < MAX_RETRIES) {
+        retriesRef.current++;
+        setTimeout(() => connect(addr), 3000);
+      }
+    };
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'stats' && windowSec === 60) {
+          setEndpoints(msg.endpoints ?? []);
+        }
+      } catch (_) {}
+    };
+  }
+
+  // REST 폴링: window != 60일 때 2초마다 /api/v1/stats 호출
+  useEffect(() => {
+    if (windowSec === 60) return;
+    const fetchStats = () => {
+      fetch(`${window.location.protocol}//${serverAddr}/api/v1/stats?window=${windowSec}`)
+        .then(r => r.json())
+        .then(data => setEndpoints(data.endpoints ?? []))
+        .catch(() => {});
+    };
+    fetchStats();
+    const id = setInterval(fetchStats, 2000);
+    return () => clearInterval(id);
+  }, [windowSec, serverAddr]);
+
+  const filtered = useMemo(() => {
+    const ns = namespace.trim().toLowerCase();
+    return (endpoints ?? []).filter(ep =>
+      !ns || ep.namespace?.toLowerCase().includes(ns)
+    );
+  }, [endpoints, namespace]);
+
+  const summary = useMemo(() => {
+    const total   = filtered.reduce((s, e) => s + e.total,   0);
+    const success = filtered.reduce((s, e) => s + e.success, 0);
+    const error   = filtered.reduce((s, e) => s + e.error,   0);
+    const rate    = total > 0 ? (success / total * 100) : null;
+    return { total, success, error, rate };
+  }, [filtered]);
+
+  return (
+    <>
+      <header>
+        <h1>⬡ Nefi</h1>
+        <span className={`badge ${connected ? 'connected' : 'disconnected'}`}>
+          {connected ? '● Live' : '○ Disconnected'}
+        </span>
+        <a href="/topology" style={{ marginLeft: 'auto', fontSize: 13, color: '#6366f1', textDecoration: 'none' }}>
+          토폴로지 →
+        </a>
+      </header>
+
+      <div className="controls">
+        <label>
+          Server
+          <input
+            value={serverAddr}
+            onChange={e => setServerAddr(e.target.value)}
+            placeholder="localhost:8080"
+            style={{ width: 180 }}
+          />
+        </label>
+        <label>
+          Namespace 필터
+          <input
+            value={namespace}
+            onChange={e => setNamespace(e.target.value)}
+            placeholder="전체"
+            style={{ width: 160 }}
+          />
+        </label>
+        <label>
+          윈도우
+          <select value={windowSec} onChange={e => setWindowSec(Number(e.target.value))}>
+            <option value={10}>10초</option>
+            <option value={30}>30초</option>
+            <option value={60}>1분</option>
+            <option value={300}>5분</option>
+          </select>
+        </label>
+      </div>
+
+      {filtered.length > 0 && (
+        <div className="summary">
+          <div className="stat-card">
+            <div className="label">전체 요청</div>
+            <div className="value">{summary.total.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">성공</div>
+            <div className="value green">{summary.success.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">에러</div>
+            <div className="value red">{summary.error.toLocaleString()}</div>
+          </div>
+          {summary.rate !== null && (
+            <div className="stat-card">
+              <div className="label">전체 성공률</div>
+              <div className="value" style={{ color: rateColor(summary.rate) }}>
+                {summary.rate.toFixed(1)}%
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="main">
+        {filtered.length === 0 ? (
+          <div className="empty">
+            {connected ? '수신된 데이터가 없습니다.' : '서버에 연결 중...'}
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Namespace</th>
+                <th>Workload</th>
+                <th>Pod</th>
+                <th>Method</th>
+                <th>Path</th>
+                <th>성공률</th>
+                <th>요청 수</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered
+                .slice()
+                .sort((a, b) => a.success_rate - b.success_rate)
+                .map((ep, i) => (
+                  <tr key={i}>
+                    <td style={{ color: '#94a3b8' }}>{ep.namespace || '—'}</td>
+                    <td style={{ color: '#e2e8f0', fontWeight: 500 }}>{ep.workload_name || '—'}</td>
+                    <td style={{ color: '#64748b', fontSize: 12 }}>{ep.pod_name || '—'}</td>
+                    <td>
+                      <span className={`method ${ep.method}`}>{ep.method}</span>
+                    </td>
+                    <td className="path">{ep.path}</td>
+                    <td>
+                      <div className="rate-bar">
+                        <div className="bar-bg">
+                          <div
+                            className="bar-fill"
+                            style={{
+                              width: `${ep.success_rate}%`,
+                              background: rateColor(ep.success_rate),
+                            }}
+                          />
+                        </div>
+                        <span className="rate-text" style={{ color: rateColor(ep.success_rate) }}>
+                          {ep.success_rate.toFixed(1)}%
+                        </span>
+                      </div>
+                    </td>
+                    <td>
+                      <span className="count">
+                        {ep.total.toLocaleString()} req
+                        &nbsp;/&nbsp;
+                        <span className="red">{ep.error} err</span>
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

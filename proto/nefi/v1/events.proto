@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package nefi.v1;
+
+option go_package = "github.com/gihongjo/nefi/proto/nefi/v1;nefiv1";
+
+// TraceEvent는 eBPF 캡처 이벤트 하나를 나타낸다.
+// agent가 enriching(NS/pod 이름 해석)한 뒤 server로 전송한다.
+message TraceEvent {
+  uint64 timestamp_ns = 1;
+  uint32 pid           = 2;
+  uint32 fd            = 3;
+  uint32 msg_size      = 4;
+  uint32 direction     = 5; // 0=send, 1=recv
+  uint32 protocol      = 6; // Pixie-compatible protocol number
+  uint32 msg_type      = 7; // 0=unknown, 1=req, 2=res
+
+  string comm          = 8; // process name
+  string namespace     = 9; // k8s namespace (empty if unknown)
+  string pod_name      = 10; // k8s pod name (empty if unknown)
+  string node_name     = 11; // k8s node name
+
+  uint32 remote_ip     = 12; // host byte order; 0 if unknown
+  uint32 remote_port   = 13; // host byte order; 0 if unknown
+  string remote_ns     = 14; // remote pod namespace (empty if unknown)
+  string remote_pod    = 15; // remote pod name (empty if unknown)
+
+  bytes  payload       = 16; // raw captured bytes (up to MaxMsgSize)
+
+  // HTTP-parsed metadata (populated by server collector; empty for non-HTTP)
+  string http_method   = 17; // GET, POST, PUT, DELETE, ...
+  string http_path     = 18; // /api/users/123
+  int32  http_status   = 19; // 200, 404, 500, ... (0 = request or unknown)
+  string http_content_type = 20; // application/json, text/html, ...
+}

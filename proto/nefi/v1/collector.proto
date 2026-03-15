@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package nefi.v1;
+
+option go_package = "github.com/gihongjo/nefi/proto/nefi/v1;nefiv1";
+
+import "nefi/v1/events.proto";
+
+// NefiCollector는 agent에서 server로 이벤트를 스트리밍하는 서비스다.
+// agent가 client-streaming으로 이벤트를 전송하고,
+// server는 처리 완료 후 ACK를 반환한다.
+service NefiCollector {
+  // SendEvents: agent → server 단방향 클라이언트 스트리밍.
+  // agent가 이벤트를 스트림으로 push하고, 완료 시 CollectSummary를 받는다.
+  rpc SendEvents(stream TraceEvent) returns (CollectSummary);
+}
+
+// CollectSummary는 스트림 종료 시 server가 반환하는 집계 정보다.
+message CollectSummary {
+  uint64 received = 1; // 수신된 이벤트 수
+}

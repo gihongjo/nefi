@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nefi — Topology</title>
+  <script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; display: flex; flex-direction: column; height: 100vh; }
+    header { padding: 16px 32px; border-bottom: 1px solid #1e293b; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+    header h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
+    header a { font-size: 13px; color: #6366f1; text-decoration: none; margin-left: auto; }
+    header a:hover { text-decoration: underline; }
+    .controls { display: flex; gap: 12px; padding: 14px 32px; align-items: flex-end; flex-wrap: wrap; flex-shrink: 0; border-bottom: 1px solid #1e293b; }
+    label { font-size: 12px; color: #94a3b8; display: flex; flex-direction: column; gap: 4px; }
+    input { background: #1e293b; border: 1px solid #334155; color: #e2e8f0; border-radius: 6px; padding: 6px 10px; font-size: 13px; outline: none; }
+    input:focus { border-color: #6366f1; }
+    .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 13px; cursor: pointer; }
+    .btn:hover { background: #334155; }
+    #cy { flex: 1; }
+    .tooltip {
+      position: fixed; background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+      padding: 10px 14px; font-size: 12px; color: #e2e8f0; pointer-events: none;
+      z-index: 100; display: none; line-height: 1.7;
+    }
+    .tooltip .label { color: #64748b; }
+    .stat-row { display: flex; gap: 6px; }
+    .green { color: #4ade80; }
+    .red   { color: #f87171; }
+    .yellow{ color: #facc15; }
+    #legend { padding: 10px 32px; font-size: 11px; color: #475569; flex-shrink: 0; }
+    #legend span { margin-right: 16px; }
+    #legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>⬡ Nefi — Topology</h1>
+  <a href="/">← 성공률 대시보드</a>
+</header>
+
+<div class="controls">
+  <label>
+    Server
+    <input id="serverAddr" value="" placeholder="localhost:8080" style="width:180px" />
+  </label>
+  <label>
+    Namespace 필터
+    <input id="nsFilter" placeholder="전체" style="width:150px" />
+  </label>
+  <label>
+    이벤트 수
+    <input id="limitInput" type="number" value="5000" min="100" max="50000" style="width:100px" />
+  </label>
+  <button class="btn" onclick="refresh()">새로고침</button>
+  <button class="btn" onclick="cy && cy.fit()">화면 맞춤</button>
+</div>
+
+<div id="cy"></div>
+<div id="tooltip" class="tooltip"></div>
+
+<div id="legend">
+  <span><span class="dot" style="background:#4ade80"></span>성공률 ≥ 95%</span>
+  <span><span class="dot" style="background:#facc15"></span>성공률 80~95%</span>
+  <span><span class="dot" style="background:#f87171"></span>성공률 &lt; 80%</span>
+  <span style="color:#6366f1">● 노드 = workload · 엣지 = 트래픽 방향</span>
+</div>
+
+<script>
+let cy = null;
+let intervalId = null;
+const tooltip = document.getElementById('tooltip');
+
+document.getElementById('serverAddr').value = window.location.host;
+
+function rateColor(rate) {
+  if (rate >= 95) return '#4ade80';
+  if (rate >= 80) return '#facc15';
+  return '#f87171';
+}
+
+function buildElements(data, nsFilter) {
+  const filter = nsFilter.trim().toLowerCase();
+  const nodeMap = {};
+  const edgeList = [];
+
+  (data.nodes || []).forEach(n => {
+    if (filter && !n.namespace.toLowerCase().includes(filter)) return;
+    nodeMap[n.id] = n;
+  });
+
+  (data.edges || []).forEach(e => {
+    if (!nodeMap[e.source] && !nodeMap[e.target]) return;
+    // 한 쪽이라도 필터에 걸리면 표시
+    if (filter) {
+      const srcOk = nodeMap[e.source];
+      const dstOk = nodeMap[e.target];
+      if (!srcOk && !dstOk) return;
+      // 반대편 노드가 없으면 추가 (외부 트래픽)
+      if (!nodeMap[e.source]) nodeMap[e.source] = { id: e.source, namespace: '', workload: e.source };
+      if (!nodeMap[e.target]) nodeMap[e.target] = { id: e.target, namespace: '', workload: e.target };
+    }
+    edgeList.push(e);
+  });
+
+  const elements = [];
+  Object.values(nodeMap).forEach(n => {
+    elements.push({
+      data: {
+        id: n.id,
+        label: n.workload || n.id,
+        namespace: n.namespace,
+      }
+    });
+  });
+  edgeList.forEach(e => {
+    elements.push({
+      data: {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        total: e.total,
+        success: e.success,
+        error: e.error,
+        success_rate: e.success_rate,
+        color: rateColor(e.success_rate),
+      }
+    });
+  });
+  return elements;
+}
+
+function refresh() {
+  const addr = document.getElementById('serverAddr').value.trim() || window.location.host;
+  const limit = parseInt(document.getElementById('limitInput').value) || 5000;
+  const nsFilter = document.getElementById('nsFilter').value;
+  const proto = window.location.protocol;
+
+  fetch(`${proto}//${addr}/api/v1/topology?limit=${limit}`)
+    .then(r => r.json())
+    .then(data => render(data, nsFilter))
+    .catch(err => console.error('topology fetch error:', err));
+}
+
+function render(data, nsFilter) {
+  const elements = buildElements(data, nsFilter);
+
+  if (!cy) {
+    cy = cytoscape({
+      container: document.getElementById('cy'),
+      style: [
+        {
+          selector: 'node',
+          style: {
+            'background-color': '#334155',
+            'border-color': '#6366f1',
+            'border-width': 2,
+            'label': 'data(label)',
+            'color': '#e2e8f0',
+            'font-size': '11px',
+            'text-valign': 'bottom',
+            'text-margin-y': 6,
+            'width': 40,
+            'height': 40,
+          }
+        },
+        {
+          selector: 'edge',
+          style: {
+            'width': 2,
+            'line-color': 'data(color)',
+            'target-arrow-color': 'data(color)',
+            'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier',
+            'opacity': 0.8,
+          }
+        },
+        {
+          selector: 'node:selected',
+          style: { 'border-color': '#a5b4fc', 'border-width': 3 }
+        },
+        {
+          selector: 'edge:selected',
+          style: { 'width': 4, 'opacity': 1 }
+        },
+      ],
+      layout: { name: 'cose', animate: false, padding: 60, nodeRepulsion: 6000 },
+      elements,
+    });
+
+    cy.on('mouseover', 'node', e => showNodeTooltip(e.target, e.originalEvent));
+    cy.on('mouseover', 'edge', e => showEdgeTooltip(e.target, e.originalEvent));
+    cy.on('mouseout', () => { tooltip.style.display = 'none'; });
+    cy.on('mousemove', e => {
+      if (tooltip.style.display === 'block') {
+        tooltip.style.left = (e.originalEvent.clientX + 14) + 'px';
+        tooltip.style.top  = (e.originalEvent.clientY + 14) + 'px';
+      }
+    });
+  } else {
+    cy.elements().remove();
+    cy.add(elements);
+    cy.layout({ name: 'cose', animate: false, padding: 60, nodeRepulsion: 6000 }).run();
+  }
+}
+
+function showNodeTooltip(node, ev) {
+  const d = node.data();
+  tooltip.innerHTML = `
+    <div><span class="label">Workload</span> ${d.label}</div>
+    <div><span class="label">Namespace</span> ${d.namespace || '—'}</div>
+  `;
+  tooltip.style.display = 'block';
+  tooltip.style.left = (ev.clientX + 14) + 'px';
+  tooltip.style.top  = (ev.clientY + 14) + 'px';
+}
+
+function showEdgeTooltip(edge, ev) {
+  const d = edge.data();
+  const rateClass = d.success_rate >= 95 ? 'green' : d.success_rate >= 80 ? 'yellow' : 'red';
+  tooltip.innerHTML = `
+    <div><span class="label">경로</span> ${d.source} → ${d.target}</div>
+    <div class="stat-row"><span class="label">요청</span> ${d.total.toLocaleString()}</div>
+    <div class="stat-row"><span class="label">성공</span> <span class="green">${d.success.toLocaleString()}</span></div>
+    <div class="stat-row"><span class="label">에러</span> <span class="red">${d.error.toLocaleString()}</span></div>
+    <div class="stat-row"><span class="label">성공률</span> <span class="${rateClass}">${d.success_rate.toFixed(1)}%</span></div>
+  `;
+  tooltip.style.display = 'block';
+  tooltip.style.left = (ev.clientX + 14) + 'px';
+  tooltip.style.top  = (ev.clientY + 14) + 'px';
+}
+
+// 초기 로드 + 10초 자동 갱신
+refresh();
+intervalId = setInterval(refresh, 10000);
+</script>
+</body>
+</html>
