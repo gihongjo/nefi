@@ -8,6 +8,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -38,20 +39,21 @@ type eventsResponse struct {
 }
 
 type eventResponse struct {
-	TimestampNs     uint64 `json:"ts"`
-	PID             uint32 `json:"pid"`
-	FD              uint32 `json:"fd"`
-	MsgSize         uint32 `json:"msg_size"`
-	Direction       uint32 `json:"direction"`
-	Protocol        uint32 `json:"protocol"`
-	Comm            string `json:"comm"`
-	Namespace       string `json:"namespace,omitempty"`
-	PodName         string `json:"pod_name,omitempty"`
-	NodeName        string `json:"node_name,omitempty"`
-	HttpMethod      string `json:"http_method,omitempty"`
-	HttpPath        string `json:"http_path,omitempty"`
-	HttpStatus      int32  `json:"http_status,omitempty"`
-	HttpContentType string `json:"http_content_type,omitempty"`
+	TimestampNs     uint64  `json:"ts"`
+	PID             uint32  `json:"pid"`
+	FD              uint32  `json:"fd"`
+	MsgSize         uint32  `json:"msg_size"`
+	Direction       uint32  `json:"direction"`
+	Protocol        uint32  `json:"protocol"`
+	Comm            string  `json:"comm"`
+	Namespace       string  `json:"namespace,omitempty"`
+	PodName         string  `json:"pod_name,omitempty"`
+	NodeName        string  `json:"node_name,omitempty"`
+	HttpMethod      string  `json:"http_method,omitempty"`
+	HttpPath        string  `json:"http_path,omitempty"`
+	HttpStatus      int32   `json:"http_status,omitempty"`
+	HttpContentType string  `json:"http_content_type,omitempty"`
+	LatencyMs       float64 `json:"latency_ms,omitempty"` // 레이턴시 (ms), 0이면 미측정
 }
 
 // ---- Handler ----
@@ -125,6 +127,10 @@ func (h *Handler) getEvents(c *gin.Context) {
 func toEventList(events []*nefiv1.TraceEvent) []eventResponse {
 	result := make([]eventResponse, 0, len(events))
 	for _, ev := range events {
+		latencyMs := 0.0
+		if ev.LatencyNs > 0 {
+			latencyMs = float64(ev.LatencyNs) / 1e6
+		}
 		result = append(result, eventResponse{
 			TimestampNs:     ev.TimestampNs,
 			PID:             ev.Pid,
@@ -140,6 +146,7 @@ func toEventList(events []*nefiv1.TraceEvent) []eventResponse {
 			HttpPath:        ev.HttpPath,
 			HttpStatus:      ev.HttpStatus,
 			HttpContentType: ev.HttpContentType,
+			LatencyMs:       latencyMs,
 		})
 	}
 	return result
@@ -158,13 +165,14 @@ type topoNode struct {
 }
 
 type topoEdge struct {
-	ID          string  `json:"id"`
-	Source      string  `json:"source"`
-	Target      string  `json:"target"`
-	Total       int64   `json:"total"`
-	Success     int64   `json:"success"`
-	Error       int64   `json:"error"`
-	SuccessRate float64 `json:"success_rate"`
+	ID           string  `json:"id"`
+	Source       string  `json:"source"`
+	Target       string  `json:"target"`
+	Total        int64   `json:"total"`
+	Success      int64   `json:"success"`
+	Error        int64   `json:"error"`
+	SuccessRate  float64 `json:"success_rate"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"` // 평균 레이턴시 (ms), 0이면 미측정
 }
 
 type topoResponse struct {
@@ -178,14 +186,20 @@ type edgeKey struct {
 }
 
 type edgeCounts struct {
-	total   int64
-	success int64
-	error   int64
+	total        int64
+	success      int64
+	error        int64
+	latencySum   int64 // ns 누적
+	latencyCount int64
 }
 
 // GET /api/v1/topology?limit=5000
 // store의 최근 이벤트에서 workload 간 트래픽 토폴로지를 반환한다.
-// Direction 0(SEND): 로컬 pod → 리모트 pod, Direction 1(RECV): 리모트 pod → 로컬 pod
+//
+// 노드 식별 우선순위: K8s PodName > Comm (프로세스명)
+// 엣지 방향: 요청 방향 (A→B = A가 B를 호출함)
+//   - Direction 0(SEND, 응답 송신): 리모트(클라이언트)→로컬(서버) 요청 방향
+//   - Direction 1(RECV, 응답 수신): 로컬(클라이언트)→리모트(서버) 요청 방향
 func (h *Handler) getTopology(c *gin.Context) {
 	var q topoQuery
 	if err := c.ShouldBindQuery(&q); err != nil {
@@ -202,18 +216,37 @@ func (h *Handler) getTopology(c *gin.Context) {
 	edgeMap := make(map[edgeKey]*edgeCounts)
 
 	for _, ev := range events {
-		if ev.HttpStatus == 0 || ev.PodName == "" || ev.RemotePod == "" {
+		if ev.HttpStatus == 0 {
 			continue
 		}
 
-		localID := nodeID(ev.Namespace, ev.PodName)
+		// 로컬 workload 식별: K8s PodName이 없으면 skip (호스트 프로세스 제외)
+		if ev.PodName == "" {
+			continue
+		}
+		localWorkload := aggregator.WorkloadName(ev.PodName)
+		localID := localWorkload
+		if ev.Namespace != "" {
+			localID = ev.Namespace + "/" + localWorkload
+		}
+
+		// 리모트 workload 식별: pod 이름 > pod IP 순서
 		remoteID := nodeID(ev.RemoteNs, ev.RemotePod)
+		if remoteID == "" {
+			if ev.RemoteIp != 0 {
+				remoteID = fmt.Sprintf("%d.%d.%d.%d",
+					(ev.RemoteIp>>24)&0xff, (ev.RemoteIp>>16)&0xff,
+					(ev.RemoteIp>>8)&0xff, ev.RemoteIp&0xff)
+			} else {
+				continue
+			}
+		}
 
 		if _, ok := nodeSet[localID]; !ok {
 			nodeSet[localID] = topoNode{
 				ID:        localID,
 				Namespace: ev.Namespace,
-				Workload:  aggregator.WorkloadName(ev.PodName),
+				Workload:  localWorkload,
 			}
 		}
 		if _, ok := nodeSet[remoteID]; !ok {
@@ -224,12 +257,14 @@ func (h *Handler) getTopology(c *gin.Context) {
 			}
 		}
 
-		// Direction 0=SEND: local→remote, Direction 1=RECV: remote→local
+		// 요청 방향 엣지: A→B = A가 B를 호출
+		// Direction 0(SEND=응답 송신): 로컬이 서버 → 요청은 리모트(클라이언트)→로컬(서버)
+		// Direction 1(RECV=응답 수신): 로컬이 클라이언트 → 요청은 로컬(클라이언트)→리모트(서버)
 		var src, dst string
 		if ev.Direction == 0 {
-			src, dst = localID, remoteID
-		} else {
 			src, dst = remoteID, localID
+		} else {
+			src, dst = localID, remoteID
 		}
 
 		ek := edgeKey{Src: src, Dst: dst}
@@ -244,6 +279,10 @@ func (h *Handler) getTopology(c *gin.Context) {
 		} else if ev.HttpStatus >= 400 {
 			ec.error++
 		}
+		if ev.LatencyNs > 0 {
+			ec.latencySum += int64(ev.LatencyNs)
+			ec.latencyCount++
+		}
 	}
 
 	nodes := make([]topoNode, 0, len(nodeSet))
@@ -257,14 +296,19 @@ func (h *Handler) getTopology(c *gin.Context) {
 		if ec.total > 0 {
 			rate = float64(ec.success) / float64(ec.total) * 100
 		}
+		avgLatencyMs := 0.0
+		if ec.latencyCount > 0 {
+			avgLatencyMs = float64(ec.latencySum) / float64(ec.latencyCount) / 1e6
+		}
 		edges = append(edges, topoEdge{
-			ID:          ek.Src + "->" + ek.Dst,
-			Source:      ek.Src,
-			Target:      ek.Dst,
-			Total:       ec.total,
-			Success:     ec.success,
-			Error:       ec.error,
-			SuccessRate: rate,
+			ID:           ek.Src + "->" + ek.Dst,
+			Source:       ek.Src,
+			Target:       ek.Dst,
+			Total:        ec.total,
+			Success:      ec.success,
+			Error:        ec.error,
+			SuccessRate:  rate,
+			AvgLatencyMs: avgLatencyMs,
 		})
 	}
 

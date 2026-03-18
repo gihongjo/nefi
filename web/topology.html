@@ -189,6 +189,9 @@ function render(data, nsFilter) {
       elements,
     });
 
+    // 초기 레이아웃 완료 후 노드 위치 잠금 (자동 새로고침 시 재배치 방지)
+    cy.one('layoutstop', () => { cy.nodes().lock(); });
+
     cy.on('mouseover', 'node', e => showNodeTooltip(e.target, e.originalEvent));
     cy.on('mouseover', 'edge', e => showEdgeTooltip(e.target, e.originalEvent));
     cy.on('mouseout', () => { tooltip.style.display = 'none'; });
@@ -199,9 +202,37 @@ function render(data, nsFilter) {
       }
     });
   } else {
-    cy.elements().remove();
-    cy.add(elements);
-    cy.layout({ name: 'cose', animate: false, padding: 60, nodeRepulsion: 6000 }).run();
+    // 노드 위치 고정: 기존 노드 ID 집합 파악
+    const existingNodeIds = new Set(cy.nodes().map(n => n.id()));
+    const newNodeIds = new Set(elements.filter(e => !e.data.source).map(e => e.data.id));
+
+    // 사라진 노드/엣지 제거
+    cy.nodes().forEach(n => { if (!newNodeIds.has(n.id())) cy.remove(n); });
+    cy.edges().remove();
+
+    // 새 노드 추가 (기존 노드는 위치 유지)
+    const addedNodes = [];
+    elements.forEach(el => {
+      if (!el.data.source) {
+        // 노드
+        if (!existingNodeIds.has(el.data.id)) {
+          cy.add(el);
+          addedNodes.push(el.data.id);
+        } else {
+          // 기존 노드 데이터만 업데이트 (위치는 건드리지 않음)
+          cy.getElementById(el.data.id).data(el.data);
+        }
+      }
+    });
+
+    // 엣지 추가
+    elements.forEach(el => { if (el.data.source) cy.add(el); });
+
+    // 새로 추가된 노드만 레이아웃 적용 (기존 노드 위치 보존)
+    if (addedNodes.length > 0) {
+      const newEles = cy.collection(addedNodes.map(id => cy.getElementById(id)));
+      newEles.layout({ name: 'random', animate: false }).run();
+    }
   }
 }
 

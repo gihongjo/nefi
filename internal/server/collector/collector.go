@@ -67,7 +67,7 @@ func (s *Service) SendEvents(stream nefiv1.NefiCollector_SendEventsServer) error
 // 요청 이벤트: method/path를 connTracker에 저장.
 // 응답 이벤트: connTracker에서 같은 연결의 method/path를 꺼내 채움.
 func (s *Service) enrichHTTP(event *nefiv1.TraceEvent) {
-	if event.Protocol != 1 && event.Protocol != 13 {
+	if event.Protocol != 1 {
 		return
 	}
 	parsed := httpparse.Parse(event.Payload)
@@ -79,7 +79,7 @@ func (s *Service) enrichHTTP(event *nefiv1.TraceEvent) {
 
 	if parsed.Method != "" {
 		// 요청 이벤트: 이후 응답과 매핑하기 위해 캐시에 저장
-		s.tracker.set(key, parsed.Method, parsed.Path)
+		s.tracker.set(key, parsed.Method, parsed.Path, event.TimestampNs)
 		event.HttpMethod = parsed.Method
 		event.HttpPath = parsed.Path
 		event.HttpContentType = parsed.ContentType
@@ -90,9 +90,12 @@ func (s *Service) enrichHTTP(event *nefiv1.TraceEvent) {
 		// 응답 이벤트: 같은 연결의 요청 메타데이터를 꺼내 채움
 		event.HttpStatus = parsed.StatusCode
 		event.HttpContentType = parsed.ContentType
-		if method, path, ok := s.tracker.pop(key); ok {
+		if method, path, reqTs, ok := s.tracker.pop(key); ok {
 			event.HttpMethod = method
 			event.HttpPath = path
+			if reqTs > 0 && event.TimestampNs >= reqTs {
+				event.LatencyNs = event.TimestampNs - reqTs
+			}
 		}
 	}
 }

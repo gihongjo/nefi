@@ -46,8 +46,10 @@ type TraceEvent struct {
 	HttpPath        string `protobuf:"bytes,18,opt,name=http_path,json=httpPath,proto3" json:"http_path,omitempty"`                        // /api/users/123
 	HttpStatus      int32  `protobuf:"varint,19,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`                 // 200, 404, 500, ... (0 = request or unknown)
 	HttpContentType string `protobuf:"bytes,20,opt,name=http_content_type,json=httpContentType,proto3" json:"http_content_type,omitempty"` // application/json, text/html, ...
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Latency (populated by server collector for HTTP response events)
+	LatencyNs     uint64 `protobuf:"varint,21,opt,name=latency_ns,json=latencyNs,proto3" json:"latency_ns,omitempty"` // request → response latency in nanoseconds (0 = unknown)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TraceEvent) Reset() {
@@ -220,11 +222,18 @@ func (x *TraceEvent) GetHttpContentType() string {
 	return ""
 }
 
+func (x *TraceEvent) GetLatencyNs() uint64 {
+	if x != nil {
+		return x.LatencyNs
+	}
+	return 0
+}
+
 var File_nefi_v1_events_proto protoreflect.FileDescriptor
 
 const file_nefi_v1_events_proto_rawDesc = "" +
 	"\n" +
-	"\x14nefi/v1/events.proto\x12\anefi.v1\"\xca\x04\n" +
+	"\x14nefi/v1/events.proto\x12\anefi.v1\"\xe9\x04\n" +
 	"\n" +
 	"TraceEvent\x12!\n" +
 	"\ftimestamp_ns\x18\x01 \x01(\x04R\vtimestampNs\x12\x10\n" +
@@ -251,7 +260,9 @@ const file_nefi_v1_events_proto_rawDesc = "" +
 	"\thttp_path\x18\x12 \x01(\tR\bhttpPath\x12\x1f\n" +
 	"\vhttp_status\x18\x13 \x01(\x05R\n" +
 	"httpStatus\x12*\n" +
-	"\x11http_content_type\x18\x14 \x01(\tR\x0fhttpContentTypeB/Z-github.com/gihongjo/nefi/proto/nefi/v1;nefiv1b\x06proto3"
+	"\x11http_content_type\x18\x14 \x01(\tR\x0fhttpContentType\x12\x1d\n" +
+	"\n" +
+	"latency_ns\x18\x15 \x01(\x04R\tlatencyNsB/Z-github.com/gihongjo/nefi/proto/nefi/v1;nefiv1b\x06proto3"
 
 var (
 	file_nefi_v1_events_proto_rawDescOnce sync.Once

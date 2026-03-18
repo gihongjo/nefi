@@ -104,6 +104,10 @@ func main() {
 		loader.Close()
 	}()
 
+	// nefi-agent 자신의 트래픽(gRPC 등)이 PROTO_HTTP로 오분류되어
+	// store를 오염시키는 것을 방지한다.
+	selfPID := uint32(os.Getpid())
+
 	for {
 		event, err := loader.Read()
 
@@ -116,6 +120,10 @@ func main() {
 		}
 
 		comm := event.CommString()
+
+		if event.PID == selfPID {
+			continue
+		}
 
 		if event.Protocol != model.ProtoHTTP {
 			continue
@@ -136,6 +144,11 @@ func main() {
 			if remotePod := resolver.ResolveIP(event.RemoteIP); remotePod != nil {
 				remoteNs = remotePod.Namespace
 				remotePodName = remotePod.PodName
+				remoteLabel = remoteNs + "/" + remotePodName
+			} else if svc := resolver.ResolveServiceIP(event.RemoteIP); svc != nil {
+				// ClusterIP DNAT 전 주소인 경우 서비스 이름으로 레이블 설정
+				remoteNs = svc.Namespace
+				remotePodName = svc.Name
 				remoteLabel = remoteNs + "/" + remotePodName
 			}
 		}

@@ -93,7 +93,12 @@ func (s *Sender) run() {
 		default:
 		}
 
-		if err := s.stream(); err != nil {
+		connected, err := s.stream()
+		if connected {
+			// 연결에 성공했다가 끊어진 경우 backoff 초기화
+			backoff = initialBackoff
+		}
+		if err != nil {
 			log.Printf("[sender] stream error: %v — retrying in %v", err, backoff)
 		}
 
@@ -110,12 +115,15 @@ func (s *Sender) run() {
 	}
 }
 
-func (s *Sender) stream() error {
-	conn, err := grpc.NewClient(s.serverAddr,
+// stream은 서버에 연결하고 이벤트를 스트리밍한다.
+// connected=true는 한 번이라도 스트림 전송에 성공했음을 의미하며,
+// 호출자가 backoff를 리셋하는 데 사용된다.
+func (s *Sender) stream() (connected bool, err error) {
+	conn, dialErr := grpc.NewClient(s.serverAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-	if err != nil {
-		return err
+	if dialErr != nil {
+		return false, dialErr
 	}
 	defer conn.Close()
 
@@ -123,25 +131,25 @@ func (s *Sender) stream() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stream, err := client.SendEvents(ctx)
-	if err != nil {
-		return err
+	st, streamErr := client.SendEvents(ctx)
+	if streamErr != nil {
+		return false, streamErr
 	}
 
 	log.Printf("[sender] connected to server %s", s.serverAddr)
-	// 재연결 성공 시 backoff 리셋은 호출자에서 처리 불가하므로, 채널 drain 없이 진행
+	connected = true
 
 	for {
 		select {
 		case <-s.done:
-			_, err := stream.CloseAndRecv()
-			return err
+			_, err := st.CloseAndRecv()
+			return connected, err
 		case ev, ok := <-s.ch:
 			if !ok {
-				return nil
+				return connected, nil
 			}
-			if err := stream.Send(ev); err != nil {
-				return err
+			if err := st.Send(ev); err != nil {
+				return connected, err
 			}
 		}
 	}

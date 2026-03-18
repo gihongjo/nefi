@@ -53,9 +53,11 @@ type EndpointKey struct {
 
 // Counts는 한 bucket 내 한 엔드포인트의 요청 카운터다.
 type Counts struct {
-	Total   int32
-	Success int32 // 2xx
-	Error   int32 // 4xx, 5xx
+	Total       int32
+	Success     int32 // 2xx
+	Error       int32 // 4xx, 5xx
+	LatencySum  int64 // 누적 latency (ns), latency가 있는 이벤트만 합산
+	LatencyCount int32 // latency가 측정된 이벤트 수
 }
 
 // EndpointStat는 윈도우 집계 결과 하나다.
@@ -68,7 +70,8 @@ type EndpointStat struct {
 	Total        int32   `json:"total"`
 	Success      int32   `json:"success"`
 	Error        int32   `json:"error"`
-	SuccessRate  float64 `json:"success_rate"` // 0.0~100.0
+	SuccessRate  float64 `json:"success_rate"`  // 0.0~100.0
+	AvgLatencyMs float64 `json:"avg_latency_ms"` // 평균 레이턴시 (ms), 측정값 없으면 0
 }
 
 type bucket struct {
@@ -120,6 +123,8 @@ func (a *Aggregator) Snapshot(windowSec int) []EndpointStat {
 			m.Total += c.Total
 			m.Success += c.Success
 			m.Error += c.Error
+			m.LatencySum += c.LatencySum
+			m.LatencyCount += c.LatencyCount
 			merged[k] = m
 		}
 	}
@@ -131,6 +136,10 @@ func (a *Aggregator) Snapshot(windowSec int) []EndpointStat {
 		if c.Total > 0 {
 			rate = float64(c.Success) / float64(c.Total) * 100
 		}
+		avgLatencyMs := 0.0
+		if c.LatencyCount > 0 {
+			avgLatencyMs = float64(c.LatencySum) / float64(c.LatencyCount) / 1e6
+		}
 		result = append(result, EndpointStat{
 			Namespace:    k.Namespace,
 			WorkloadName: WorkloadName(k.PodName),
@@ -141,6 +150,7 @@ func (a *Aggregator) Snapshot(windowSec int) []EndpointStat {
 			Success:      c.Success,
 			Error:        c.Error,
 			SuccessRate:  rate,
+			AvgLatencyMs: avgLatencyMs,
 		})
 	}
 	return result
@@ -223,6 +233,10 @@ func (a *Aggregator) record(ev *nefiv1.TraceEvent) {
 	} else if ev.HttpStatus >= 400 {
 		c.Error++
 	}
+	if ev.LatencyNs > 0 {
+		c.LatencySum += int64(ev.LatencyNs)
+		c.LatencyCount++
+	}
 	b.stats[key] = c
 }
 
@@ -263,6 +277,9 @@ func (a *Aggregator) prune() {
 		i++
 	}
 	if i > 0 {
+		for j := 0; j < i; j++ {
+			a.buckets[j].stats = nil // GC 가능하도록 map 참조 해제
+		}
 		a.buckets = a.buckets[i:]
 	}
 }

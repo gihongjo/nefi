@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -63,12 +64,17 @@ func New(cfg Config) (*Server, error) {
 	r.Use(cors.Default(), gin.Logger(), gin.Recovery())
 	api.New(s, agg).Register(r)
 	r.GET("/ws", gin.WrapH(h))
-	r.GET("/", func(c *gin.Context) {
-		data, _ := web.Files.ReadFile("index.html")
-		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
-	})
-	r.GET("/topology", func(c *gin.Context) {
-		data, _ := web.Files.ReadFile("topology.html")
+
+	// Svelte 빌드 결과물 (web/dist/) 서빙
+	// SPA 라우팅: /assets/* 는 파일 그대로, 나머지는 index.html 반환
+	distFS, _ := fs.Sub(web.Files, "dist")
+	r.StaticFS("/assets", http.FS(mustSub(distFS, "assets")))
+	r.NoRoute(func(c *gin.Context) {
+		data, err := fs.ReadFile(distFS, "index.html")
+		if err != nil {
+			c.String(http.StatusServiceUnavailable, "UI not built — run: cd ui && npm run build")
+			return
+		}
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	})
 
@@ -108,6 +114,15 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	return s.shutdown(runErr)
+}
+
+// mustSub는 fs.Sub 결과를 반환하며 에러 시 nil FS를 반환한다.
+func mustSub(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		return fsys
+	}
+	return sub
 }
 
 // shutdown은 gRPC → HTTP 순으로 종료하고 내부 컴포넌트를 정리한다.

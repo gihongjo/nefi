@@ -1,7 +1,7 @@
-// Package web embeds the static UI files.
+// Package web embeds the Svelte build output (ui/dist → web/dist).
 package web
 
 import "embed"
 
-//go:embed index.html topology.html
+//go:embed dist
 var Files embed.FS

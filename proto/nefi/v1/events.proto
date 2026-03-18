@@ -32,4 +32,7 @@ message TraceEvent {
   string http_path     = 18; // /api/users/123
   int32  http_status   = 19; // 200, 404, 500, ... (0 = request or unknown)
   string http_content_type = 20; // application/json, text/html, ...
+
+  // Latency (populated by server collector for HTTP response events)
+  uint64 latency_ns = 21; // request → response latency in nanoseconds (0 = unknown)
 }

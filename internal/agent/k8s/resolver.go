@@ -29,14 +29,21 @@ type PodInfo struct {
 	PodName   string
 }
 
+// ServiceInfo holds the Kubernetes identity of a Service.
+type ServiceInfo struct {
+	Namespace string
+	Name      string
+}
+
 // Resolver maps host PIDs and pod IPs to Kubernetes pod metadata.
 type Resolver struct {
-	client    kubernetes.Interface
-	nodeName  string
-	podsByUID map[string]*PodInfo // pod UID → PodInfo  (this node only)
-	podsByIP  map[string]*PodInfo // pod IP  → PodInfo  (cluster-wide)
-	pidCache  map[uint32]*PodInfo // pid     → PodInfo  (nil = not a pod)
-	mu        sync.RWMutex
+	client       kubernetes.Interface
+	nodeName     string
+	podsByUID    map[string]*PodInfo    // pod UID → PodInfo  (this node only)
+	podsByIP     map[string]*PodInfo    // pod IP  → PodInfo  (cluster-wide)
+	servicesByIP map[string]*ServiceInfo // ClusterIP → ServiceInfo (cluster-wide)
+	pidCache     map[uint32]*PodInfo    // pid     → PodInfo  (nil = not a pod)
+	mu           sync.RWMutex
 }
 
 // NewResolver creates a resolver using the in-cluster kubeconfig.
@@ -52,11 +59,12 @@ func NewResolver() (*Resolver, error) {
 	}
 
 	r := &Resolver{
-		client:    client,
-		nodeName:  os.Getenv("NODE_NAME"),
-		podsByUID: make(map[string]*PodInfo),
-		podsByIP:  make(map[string]*PodInfo),
-		pidCache:  make(map[uint32]*PodInfo),
+		client:       client,
+		nodeName:     os.Getenv("NODE_NAME"),
+		podsByUID:    make(map[string]*PodInfo),
+		podsByIP:     make(map[string]*PodInfo),
+		servicesByIP: make(map[string]*ServiceInfo),
+		pidCache:     make(map[uint32]*PodInfo),
 	}
 
 	if err := r.refreshPods(); err != nil {
@@ -93,9 +101,10 @@ func (r *Resolver) Resolve(pid uint32) *PodInfo {
 	return info
 }
 
-// refreshPods fetches pods and rebuilds lookup maps:
-//   - podsByUID: this node's pods only (UID → PodInfo), used for PID resolution
-//   - podsByIP:  all cluster pods (IP → PodInfo), used for remote IP resolution
+// refreshPods fetches pods and services, rebuilding all lookup maps:
+//   - podsByUID:    this node's pods only (UID → PodInfo), used for PID resolution
+//   - podsByIP:     all cluster pods (IP → PodInfo), used for remote IP resolution
+//   - servicesByIP: all cluster services (ClusterIP → ServiceInfo), fallback for DNAT'd traffic
 //
 // pidCache is cleared so stale entries are re-resolved on next access.
 func (r *Resolver) refreshPods() error {
@@ -111,6 +120,13 @@ func (r *Resolver) refreshPods() error {
 
 	// Fetch all cluster pods for IP-based remote pod resolution.
 	allPods, err := r.client.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Fetch all services for ClusterIP → service name resolution.
+	// connect() syscall에서 캡처한 remote IP가 DNAT 전 ClusterIP일 때 사용된다.
+	allSvcs, err := r.client.CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -136,9 +152,23 @@ func (r *Resolver) refreshPods() error {
 		}
 	}
 
+	newByServiceIP := make(map[string]*ServiceInfo, len(allSvcs.Items))
+	for i := range allSvcs.Items {
+		svc := &allSvcs.Items[i]
+		ip := svc.Spec.ClusterIP
+		if ip == "" || ip == "None" {
+			continue
+		}
+		newByServiceIP[ip] = &ServiceInfo{
+			Namespace: svc.Namespace,
+			Name:      svc.Name,
+		}
+	}
+
 	r.mu.Lock()
 	r.podsByUID = newByUID
 	r.podsByIP = newByIP
+	r.servicesByIP = newByServiceIP
 	r.pidCache = make(map[uint32]*PodInfo)
 	r.mu.Unlock()
 
@@ -159,6 +189,20 @@ func (r *Resolver) ResolveIP(ip uint32) *PodInfo {
 	return r.podsByIP[ipStr]
 }
 
+// ResolveServiceIP returns the ServiceInfo for the given ClusterIP (host byte order),
+// or nil if no service with that IP is known.
+// connect() syscall이 DNAT 전 ClusterIP를 캡처하는 경우의 fallback으로 사용된다.
+func (r *Resolver) ResolveServiceIP(ip uint32) *ServiceInfo {
+	if ip == 0 {
+		return nil
+	}
+	ipStr := fmt.Sprintf("%d.%d.%d.%d",
+		(ip>>24)&0xff, (ip>>16)&0xff, (ip>>8)&0xff, ip&0xff)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.servicesByIP[ipStr]
+}
+
 func (r *Resolver) runRefresh(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -171,8 +215,9 @@ func (r *Resolver) runRefresh(interval time.Duration) {
 // pod UID from the cgroup path.
 //
 // Supported formats:
-//   cgroup v1: /kubepods/burstable/pod<uid>/<container-id>
-//   cgroup v2: /kubepods.slice/.../kubepods-burstable-pod<uid-underscored>.slice/...
+//
+//	cgroup v1: /kubepods/burstable/pod<uid>/<container-id>
+//	cgroup v2: /kubepods.slice/.../kubepods-burstable-pod<uid-underscored>.slice/...
 func podUIDFromCgroup(pid uint32) (string, error) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {

@@ -11,7 +11,7 @@ metadata:
   name: nefi-agent
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services"]
     verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

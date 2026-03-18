@@ -16,9 +16,10 @@ type connKey struct {
 }
 
 type connEntry struct {
-	method    string
-	path      string
-	expiresAt time.Time
+	method          string
+	path            string
+	reqTimestampNs  uint64
+	expiresAt       time.Time
 }
 
 // connTracker는 HTTP 요청(method/path)을 fd 단위로 캐시해두고,
@@ -34,27 +35,28 @@ func newConnTracker() *connTracker {
 	return t
 }
 
-// set은 요청 이벤트의 method/path를 연결 키에 저장한다.
-func (t *connTracker) set(key connKey, method, path string) {
+// set은 요청 이벤트의 method/path/timestamp를 연결 키에 저장한다.
+func (t *connTracker) set(key connKey, method, path string, reqTimestampNs uint64) {
 	t.mu.Lock()
 	t.cache[key] = connEntry{
-		method:    method,
-		path:      path,
-		expiresAt: time.Now().Add(connTTL),
+		method:         method,
+		path:           path,
+		reqTimestampNs: reqTimestampNs,
+		expiresAt:      time.Now().Add(connTTL),
 	}
 	t.mu.Unlock()
 }
 
-// pop은 연결 키에 저장된 method/path를 꺼내고 캐시에서 제거한다.
-func (t *connTracker) pop(key connKey) (method, path string, ok bool) {
+// pop은 연결 키에 저장된 method/path/timestamp를 꺼내고 캐시에서 제거한다.
+func (t *connTracker) pop(key connKey) (method, path string, reqTimestampNs uint64, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, exists := t.cache[key]
 	if !exists {
-		return "", "", false
+		return "", "", 0, false
 	}
 	delete(t.cache, key)
-	return e.method, e.path, true
+	return e.method, e.path, e.reqTimestampNs, true
 }
 
 // cleanup은 10초마다 만료된 항목을 제거한다.

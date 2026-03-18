@@ -1,5 +1,6 @@
 .PHONY: agent agent-deploy agent-logs agent-clean \
         agent-enable-node agent-disable-node \
+        ui ui-dev \
         server server-deploy server-logs server-clean \
         proto \
         bcc-test bcc-test-deploy bcc-test-logs bcc-test-clean help
@@ -33,13 +34,23 @@ agent-enable-node:
 agent-disable-node:
 	kubectl label node $(NODE) nefi-agent-
 
+## UI (Svelte + Vite)
+
+ui:
+	cd ui && npm ci && npm run build
+
+ui-dev:
+	cd ui && npm run dev
+
 ## Server
 
-server:
+server: ui
 	docker build -f Dockerfile.server -t $(REGISTRY)/nefi-server:latest .
 	docker push $(REGISTRY)/nefi-server:latest
 
 server-deploy: server
+	docker build -f Dockerfile.server -t $(REGISTRY)/nefi-server:latest .
+	docker push $(REGISTRY)/nefi-server:latest
 	kubectl create namespace nefi --dry-run=client -o yaml | kubectl apply -f -
 	kubectl delete deployment nefi-server -n nefi --ignore-not-found
 	kubectl apply -f deploy/server-deployment.yaml
@@ -91,8 +102,12 @@ help:
 	@echo "  make agent-enable-node NODE=X    Deploy agent to node X"
 	@echo "  make agent-disable-node NODE=X   Remove agent from node X"
 	@echo ""
+	@echo "UI (Svelte + Vite):"
+	@echo "  make ui                          Build UI (npm ci + npm run build → web/dist/)"
+	@echo "  make ui-dev                      Start Vite dev server (localhost:5173)"
+	@echo ""
 	@echo "Server:"
-	@echo "  make server                      Build server image"
+	@echo "  make server                      Build UI then server Docker image"
 	@echo "  make server-deploy               Build, push, and deploy Deployment"
 	@echo "  make server-logs                 Follow server logs"
 	@echo "  make server-clean                Delete Deployment"
