@@ -48,19 +48,18 @@ nefi takes none of these approaches. By attaching eBPF probes to both kernel sys
 ┌─────────────────────────────────────────┐
 │  nefi-server                            │
 │  ├── gRPC CollectorService   (:9090)    │
-│  ├── In-memory store (500k events)      │
-│  ├── 1s sliding-window aggregator       │
-│  ├── WebSocket hub → browser           │
+│  ├── In-memory store (500k events)      │  ◀─ source of truth
+│  │     ├── Aggregator (1s buckets)      │     for all consumers
+│  │     │     └── WebSocket hub          │
+│  │     └── WebSocket hub (history)      │
 │  └── REST API                (:8080)    │
-└─────────────────┬───────────────────────┘
-                  │ WebSocket
-                  ▼
-┌─────────────────────────────────────────┐
-│  Web UI (Svelte 5)                      │
-│  ├── Dashboard  — live endpoint stats   │
-│  ├── Topology   — live service graph    │
-│  └── Settings   — themes & layout       │
-└─────────────────────────────────────────┘
+└──────────────┬──────────────────────────┘
+               │
+       ┌───────┴────────────┐
+       │ WebSocket           │ REST (polling)
+       ▼                     ▼
+  Dashboard              Topology
+  (stats, 1s push)       (10s interval)
 ```
 
 ---
@@ -79,14 +78,14 @@ nefi takes none of these approaches. By attaching eBPF probes to both kernel sys
 
 - [x] **nefi-server**
   - gRPC `CollectorService` receiving events from all agents
-  - In-memory ring buffer (last 500k events)
+  - In-memory ring buffer (last 500k events) — single source of truth
   - Sliding-window aggregator (1s buckets, up to 5-minute window)
-  - WebSocket hub broadcasting aggregated stats every second
+  - WebSocket hub: pushes aggregated stats (1s) and raw events to connected browsers
   - REST API: `GET /stats`, `GET /events`, `GET /topology`
 
 - [x] **Web UI**
-  - Dashboard: per-endpoint request count, success rate, latency — live
-  - Topology: interactive service graph (cytoscape.js + dagre), color-coded by success rate
+  - Dashboard: per-endpoint request count, success rate, latency — live via WebSocket (1-minute window) or REST polling (other windows)
+  - Topology: interactive service graph (cytoscape.js + dagre), color-coded by success rate — refreshed every 10s via REST
   - Settings: 6 themes, node/edge visual customization
 
 - [x] **Kubernetes manifests** — DaemonSet + Deployment YAML
@@ -99,6 +98,7 @@ nefi takes none of these approaches. By attaching eBPF probes to both kernel sys
 - [ ] Multi-cluster support
 - [ ] Dashboard authentication
 - [ ] Helm chart
+- [ ] Struct layout validation — automated check that `DataEvent` (Go) and `data_event_t` (C) field order and sizes match at build time, to catch silent misreads caused by any layout drift
 
 ---
 
